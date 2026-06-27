@@ -1,3 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# CUDA-enabled PyTorch for NVIDIA GPUs on Windows.
+torch==2.11.0+cu128
+
 sentence-transformers
 numpy
 scikit-learn

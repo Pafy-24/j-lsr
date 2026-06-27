@@ -1,93 +1,268 @@
 # Semantic Router
 
+Prototype CLI for deriving routing embeddings from faucet training datasets and routing prompts to the closest faucet.
 
+The project should run with the VS Code interpreter:
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.fsisc.ro/stefan-sebastian.romas/semantic-router.git
-git branch -M main
-git push -uf origin main
+```powershell
+C:\Users\xxsho\.conda\envs\licenta\python.exe
 ```
 
-## Integrate with your tools
+From a terminal:
 
-- [ ] [Set up project integrations](https://gitlab.fsisc.ro/stefan-sebastian.romas/semantic-router/-/settings/integrations)
+```powershell
+conda activate licenta
+cd E:\Licenta\Proiect\semantic-router
+```
 
-## Collaborate with your team
+## Project Layout
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+- `router.py` - CLI implementation
+- `requirements.txt` - Python dependencies
+- `..\faucets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
+- `..\faucets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
 
-## Test and Deploy
+There is no `signatures.json` in the active flow. A faucet signature is stored as:
 
-Use the built-in continuous integration in GitLab.
+```text
+[faucet].sig
+```
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+The `.sig` file is binary ASN.1 DER. It contains:
 
-***
+```text
+FacetSignature ::= SEQUENCE {
+  version     INTEGER,
+  modelHash   OCTET STRING,
+  dimension   INTEGER,
+  layers      SEQUENCE OF Layer
+}
 
-# Editing this README
+Layer ::= SEQUENCE {
+  level       INTEGER,
+  vectors     OCTET STRING,
+  links       SEQUENCE OF Link OPTIONAL
+}
+```
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Vectors are stored as contiguous little-endian `float32` values in `OCTET STRING`. Links are numeric parent-to-child IDs, so no separate `.idx` file is needed.
 
-## Suggestions for a good README
+## Crypto Dataset
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The current Crypto dataset is the full raw downloaded dataset from:
 
-## Name
-Choose a self-explaining name for your project.
+```text
+natnitaract/exams-basic-and-quantum-cryptography-and-security-latex
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+It contains 104 exam-level records and 347 questions. The dataset keeps training fields such as `solution`; the router ignores solution/output fields when building routing signatures.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Generate Crypto Signature
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+The router reads the full dataset and automatically extracts routing text from useful prompt-side fields:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+- `topic`
+- `describe`
+- `questions[].question`
+- `tags`
+- `questions[].tags`
+- `questions[].prerequisite_knowledge`
+- `questions[].difficulty`
+- `questions[].problem_type`
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+It does not embed `solution` as answer text. It may extract short technical keywords from `solution` and `question`, such as `ECDSA`, `nonce`, `POVM`, or `private key`, because those improve routing without training on the full answer.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```powershell
+python router.py --sign `
+  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
+  --signatures ..\faucets\signatures `
+  --debug
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Because the path is under `faucets\Crypto`, the facet name is inferred as `crypto`. You can also pass it explicitly:
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```powershell
+python router.py --sign `
+  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
+  --facet crypto `
+  --signatures ..\faucets\signatures
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## Layer Rule
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+Layer sizing is intentionally not exposed as normal CLI tuning. The router uses a fixed geometric rule:
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```text
+L1 = min(128, anchor_count)
+L(n+1) = min(anchor_count, L(n) * 10)
+stop when L(n) == anchor_count
+```
 
-## License
-For open source projects, say how it is licensed.
+That gives a stable top-level comparison cost while allowing larger faucets to grow deeper:
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```text
+977 anchors    -> L1=128, L2=977
+10,000 anchors -> L1=128, L2=1280, L3=10000
+100,000 anchors -> L1=128, L2=1280, L3=12800, L4=100000
+```
+
+The last layer is always the anchor-vector layer. Intermediate layers are centroids linked numerically to the next layer.
+
+Build order is bottom-up:
+
+```text
+1. generate/cap the maximum anchor-vector layer
+2. cluster that layer to create the previous/coarser layer
+3. repeat until L1 has at most 128 centroids
+```
+
+For the current Crypto dataset, the router extracts 977 focused routing texts and stores:
+
+```text
+L1 = 128 macro-centroids
+L2 = 977 anchor vectors
+```
+
+The signature is written to:
+
+```text
+..\faucets\signatures\crypto.sig
+```
+
+## Descend Policy
+
+Routing does not send every faucet to the deepest layer.
+
+```text
+1. score every faucet on L1 only
+2. always descend at least the top-k L1 faucets
+3. also descend near-tie faucets if:
+   score >= 0.18 and score >= best_l1_score - 0.08
+4. never descend more than 8 faucets per query
+```
+
+Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
+
+## Route Prompts
+
+Route against all `.sig` files in a signature directory:
+
+```powershell
+python router.py "How can I recover an ECDSA private key if the nonce k is reused?" `
+  --signatures ..\faucets\signatures
+```
+
+Route against one specific signature:
+
+```powershell
+python router.py "How do I verify a DSA signature?" `
+  --signatures ..\faucets\signatures\crypto.sig
+```
+
+Input file:
+
+```powershell
+python router.py -in prompt.txt `
+  --signatures ..\faucets\signatures `
+  --top-k 5
+```
+
+Batch route many prompts in one process:
+
+```powershell
+python router.py --batch --json `
+  -in ..\router_test_crypto_web_100.json `
+  --signatures ..\faucets\signatures `
+  --PU 1
+```
+
+Batch mode loads the model and signatures once, embeds all prompts together, and emits JSON. This is the preferred mode for evaluation and bulk routing.
+
+By default, model loading is local-only:
+
+```text
+SentenceTransformer(..., local_files_only=True)
+```
+
+Use `--online` only when the model is not already cached and the machine is allowed to download it.
+
+## Processing Units
+
+List processing units visible to the router:
+
+```powershell
+python router.py --PUs
+```
+
+Select a processing unit for signing or routing:
+
+```powershell
+python router.py --sign `
+  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
+  --signatures ..\faucets\signatures `
+  --PU 1
+
+python router.py "How do I verify an ECDSA signature?" `
+  --signatures ..\faucets\signatures `
+  --PU 1
+```
+
+`--PUs` always includes CPU index `0`. It also reports GPUs/NPUs detected by Windows even when the current Python backend cannot use them. The `Usable` column tells whether `--PU <index>` can actually be used for embeddings.
+
+On this machine, the `licenta` environment uses Python 3.11 and `torch 2.11.0+cu128`. The NVIDIA RTX GPU is usable through `torch.cuda` and appears as `--PU 1`. Windows also detects the AMD NPU, but it remains unusable for the current SentenceTransformer/PyTorch backend.
+
+## Example Result
+
+```text
+Rank | Facet  | Score  | Best Vector | Cluster | Exact | Mode | Best Match
+1    | crypto | 0.6042 | 0.6276      | 0.6029  | 23    | deep | vector #671
+```
+
+With only one faucet signature, every prompt returns `crypto`; the score is semantic similarity, not a calibrated probability. Add more faucet `.sig` files to compare facets directly. The `Exact` column shows how many layer-3 vectors were actually scanned after hierarchical pruning.
+
+## Other Supported Dataset Shapes
+
+The router still supports simpler JSON lists:
+
+```json
+[
+  {
+    "facet": "crypto",
+    "text": "Verify RSA signatures using OpenSSL EVP."
+  }
+]
+```
+
+It also supports prompt-side fields:
+
+```json
+[
+  {
+    "facet": "crypto",
+    "instruction": "Explain signature verification.",
+    "input": "Use OpenSSL EVP with RSA.",
+    "output": "Answer text is ignored unless no other text exists.",
+    "tags": ["rsa", "openssl"]
+  }
+]
+```
+
+For those shapes, routing text uses `text` first, otherwise `instruction + input + tags`, and only uses `output` as a last resort.
+
+## CLI Options
+
+```text
+--sign                Generate or update vector signatures
+-in, --input PATH     Input file path
+--facet NAME          Optional when facet can be inferred from the faucet path
+--signatures PATH     .sig file or directory of .sig files, default signatures
+--top-k N             Number of routed facets to show, default 3
+--batch               Route many prompts from JSON/JSONL/stdin in one process
+--json                Print machine-readable JSON output
+--model NAME          SentenceTransformer model name
+--online              Allow model downloads/checks; default is local-only
+--max-vectors N       Maximum layer-3 vectors stored per faucet, default 10000
+--PUs                 List available processing units and exit
+--PU N                Use processing unit index N for embeddings
+--debug               Print extra details
+```

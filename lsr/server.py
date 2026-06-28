@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import json
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from .embedding import embed_texts, load_model
+from .errors import RouterError
+from .models import LayeredSignature
+from .routing import LSRRouter, expand_query, json_ready_route
+from .signatures import SignatureStore
+
+
+class LSRRouteService:
+    def __init__(
+        self,
+        signatures_path: str,
+        model_name: str,
+        pu_index: int | None,
+        online: bool,
+        default_top_k: int,
+    ):
+        if default_top_k < 1:
+            raise RouterError("--top-k must be at least 1.")
+        self.signatures_path = signatures_path
+        self.model_name = model_name
+        self.default_top_k = default_top_k
+        self.signatures: dict[str, LayeredSignature] = {}
+        if signatures_path:
+            self.load_signatures(signatures_path, required=True)
+        self.model = load_model(model_name, pu_index, online)
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "service": "LSR",
+            "model": self.model_name,
+            "signatures": self.signatures_path,
+            "facets": sorted(self.signatures),
+            "default_top_k": self.default_top_k,
+        }
+
+    def load_signatures(self, path: str, required: bool = True) -> dict[str, Any]:
+        loaded = SignatureStore(path).load_all(required=required)
+        self.signatures.update(loaded)
+        self.signatures_path = path
+        return {
+            "loaded": sorted(loaded),
+            "facets": sorted(self.signatures),
+        }
+
+    def unload_signatures(
+        self, facets: list[str] | None = None, unload_all: bool = False
+    ) -> dict[str, Any]:
+        if unload_all:
+            removed = sorted(self.signatures)
+            self.signatures.clear()
+            return {"unloaded": removed, "facets": []}
+        if not facets:
+            raise RouterError("Provide facets or all=true.")
+
+        removed: list[str] = []
+        missing: list[str] = []
+        for facet in facets:
+            key = facet.strip().lower()
+            if key in self.signatures:
+                del self.signatures[key]
+                removed.append(key)
+            else:
+                missing.append(key)
+        return {
+            "unloaded": removed,
+            "missing": missing,
+            "facets": sorted(self.signatures),
+        }
+
+    def route_one(self, prompt: str, top_k: int | None = None) -> dict[str, Any]:
+        prompt = prompt.strip()
+        if not prompt:
+            raise RouterError("Missing prompt.")
+        if not self.signatures:
+            raise RouterError("No signatures loaded. Use loadsig first.")
+        active_top_k = self._top_k(top_k)
+        routed_prompt = expand_query(prompt)
+        prompt_embedding = embed_texts(self.model, [routed_prompt])[0]
+        route = LSRRouter(self.signatures, active_top_k).route(
+            prompt, routed_prompt, prompt_embedding
+        )
+        return json_ready_route(route)
+
+    def route_batch(self, prompts: list[str], top_k: int | None = None) -> list[dict[str, Any]]:
+        cleaned = [prompt.strip() for prompt in prompts]
+        if not cleaned:
+            raise RouterError("Missing prompts.")
+        if not self.signatures:
+            raise RouterError("No signatures loaded. Use loadsig first.")
+        for index, prompt in enumerate(cleaned, start=1):
+            if not prompt:
+                raise RouterError(f"Batch item {index} has no prompt text.")
+        active_top_k = self._top_k(top_k)
+        routed_prompts = [expand_query(prompt) for prompt in cleaned]
+        embeddings = embed_texts(self.model, routed_prompts)
+        router = LSRRouter(self.signatures, active_top_k)
+        return [
+            json_ready_route(router.route(prompt, routed_prompt, embeddings[index]))
+            for index, (prompt, routed_prompt) in enumerate(zip(cleaned, routed_prompts))
+        ]
+
+    def _top_k(self, top_k: int | None) -> int:
+        active_top_k = self.default_top_k if top_k is None else int(top_k)
+        if active_top_k < 1:
+            raise RouterError("top_k must be at least 1.")
+        return active_top_k
+
+
+class LSRHTTPServer(ThreadingHTTPServer):
+    def __init__(self, address: tuple[str, int], service: LSRRouteService):
+        super().__init__(address, LSRRequestHandler)
+        self.service = service
+
+
+class LSRRequestHandler(BaseHTTPRequestHandler):
+    server: LSRHTTPServer
+
+    def do_GET(self) -> None:
+        if self.path in {"/", "/health"}:
+            self._write_json(HTTPStatus.OK, self.server.service.health())
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+    def do_POST(self) -> None:
+        try:
+            payload = self._read_json()
+            if self.path in {"/route", "/rank"}:
+                response = self.server.service.route_one(
+                    extract_prompt(payload), extract_top_k(payload)
+                )
+            elif self.path == "/batch":
+                response = self.server.service.route_batch(
+                    extract_prompts(payload), extract_top_k(payload)
+                )
+            elif self.path == "/loadsig":
+                response = self.server.service.load_signatures(extract_signature_path(payload))
+            elif self.path == "/unloadsig":
+                facets, unload_all = extract_unload_request(payload)
+                response = self.server.service.unload_signatures(facets, unload_all)
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+                return
+            self._write_json(HTTPStatus.OK, response)
+        except RouterError as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except json.JSONDecodeError:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body."})
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _read_json(self) -> Any:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            raise RouterError("Missing JSON body.")
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _write_json(self, status: HTTPStatus, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def extract_prompt(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        raise RouterError("Request body must be an object or prompt string.")
+    prompt = payload.get("input") or payload.get("prompt") or payload.get("text")
+    if not isinstance(prompt, str):
+        raise RouterError("Request body must include input, prompt, or text.")
+    return prompt
+
+
+def extract_prompts(payload: Any) -> list[str]:
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("inputs") or payload.get("prompts") or payload.get("texts")
+    else:
+        items = None
+    if not isinstance(items, list):
+        raise RouterError("Batch body must be a list or include inputs/prompts/texts.")
+    prompts: list[str] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, str):
+            prompts.append(item)
+        elif isinstance(item, dict):
+            prompt = item.get("input") or item.get("prompt") or item.get("text")
+            if not isinstance(prompt, str):
+                raise RouterError(f"Batch item {index} has no prompt text.")
+            prompts.append(prompt)
+        else:
+            raise RouterError(f"Batch item {index} must be a string or object.")
+    return prompts
+
+
+def extract_top_k(payload: Any) -> int | None:
+    if not isinstance(payload, dict) or payload.get("top_k") is None:
+        return None
+    try:
+        return int(payload["top_k"])
+    except (TypeError, ValueError) as exc:
+        raise RouterError("top_k must be an integer.") from exc
+
+
+def extract_signature_path(payload: Any) -> str:
+    if isinstance(payload, str):
+        path = payload
+    elif isinstance(payload, dict):
+        path = payload.get("signatures") or payload.get("path")
+    else:
+        path = None
+    if not isinstance(path, str) or not path.strip():
+        raise RouterError("Request body must include signatures or path.")
+    return path.strip()
+
+
+def extract_unload_request(payload: Any) -> tuple[list[str] | None, bool]:
+    if isinstance(payload, str):
+        return [payload], False
+    if not isinstance(payload, dict):
+        raise RouterError("Unload body must be an object, facet string, or all=true.")
+    unload_all = bool(payload.get("all"))
+    raw_facets = payload.get("facets")
+    if raw_facets is None and payload.get("facet") is not None:
+        raw_facets = [payload["facet"]]
+    if raw_facets is None:
+        return None, unload_all
+    if not isinstance(raw_facets, list) or not all(isinstance(item, str) for item in raw_facets):
+        raise RouterError("facets must be a list of strings.")
+    return raw_facets, unload_all
+
+
+def serve(
+    host: str,
+    port: int,
+    signatures_path: str,
+    model_name: str,
+    pu_index: int | None,
+    online: bool,
+    default_top_k: int,
+    load_initial_signatures: bool = True,
+) -> None:
+    service = LSRRouteService(
+        signatures_path=signatures_path if load_initial_signatures else "",
+        model_name=model_name,
+        pu_index=pu_index,
+        online=online,
+        default_top_k=default_top_k,
+    )
+    server = LSRHTTPServer((host, port), service)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()

@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from .dependencies import ensure_numpy, get_sentence_transformer_class
+from .devices import select_processing_unit
+
+
+def normalize_matrix(matrix: Any) -> Any:
+    np = ensure_numpy()
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
+
+
+class EmbeddingService:
+    def __init__(
+        self,
+        model_name: str,
+        pu_index: int | None = None,
+        online: bool = False,
+        model: Any | None = None,
+    ):
+        self.model_name = model_name
+        self.pu_index = pu_index
+        self.online = online
+        self._model = model
+
+    @property
+    def model(self) -> Any:
+        if self._model is None:
+            self._model = self._load_model()
+        return self._model
+
+    def embed(self, texts: list[str]) -> Any:
+        return embed_texts(self.model, texts)
+
+    def _load_model(self) -> Any:
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        unit = select_processing_unit(self.pu_index)
+        sentence_transformer_class = get_sentence_transformer_class()
+        kwargs = {"local_files_only": not self.online}
+        if unit is None:
+            return sentence_transformer_class(self.model_name, **kwargs)
+        return sentence_transformer_class(self.model_name, device=unit.device, **kwargs)
+
+
+def embed_texts(model: Any, texts: list[str]) -> Any:
+    np = ensure_numpy()
+    if not texts:
+        return np.empty((0, 0), dtype=np.float32)
+    embeddings = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def load_model(model_name: str, pu_index: int | None = None, online: bool = False) -> Any:
+    return EmbeddingService(model_name, pu_index, online).model

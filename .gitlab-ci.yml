@@ -1,26 +1,34 @@
-# You can override the included template(s) by including variable overrides
-# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
-# Secret Detection customization: https://docs.gitlab.com/ee/user/application_security/secret_detection/pipeline/#customization
-# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
-# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
-# Note that environment variables can be set in several places
-# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+image: python:3.11-slim
+
 stages:
-- build
-- test
-- deploy
-- review
-- dast
-- staging
-- canary
-- production
-- incremental rollout 10%
-- incremental rollout 25%
-- incremental rollout 50%
-- incremental rollout 100%
-- performance
-- cleanup
-sast:
+  - validate
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/pip/
+
+before_script:
+  - python --version
+  - python -m pip install --upgrade pip
+
+validate:syntax:
+  stage: validate
+  script:
+    - python -m compileall router.py lsr
+
+validate:naming:
+  stage: validate
+  script:
+    - python -c "from pathlib import Path; banned=('semantic'+'_router','Semantic'+'Router','Semantic'+' Router','semantic'+'-router','semantic'+' router'); allowed={'.py','.md','.yml','.yaml','.txt','.toml','.json'}; files=[p for p in Path('.').rglob('*') if p.is_file() and p.suffix.lower() in allowed and '.git' not in p.parts and '__pycache__' not in p.parts]; hits=[f'{p}:{text}' for p in files for text in banned if text in p.read_text(encoding='utf-8', errors='ignore')]; assert not hits, '\n'.join(hits)"
+
+test:import:
   stage: test
-include:
-- template: Auto-DevOps.gitlab-ci.yml
+  script:
+    - python -B -c "import lsr, router; assert lsr.LSRRouter; assert router.LSRRouter"

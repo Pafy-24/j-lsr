@@ -1,6 +1,6 @@
-# Semantic Router
+# LSR
 
-Prototype CLI for deriving routing embeddings from faucet training datasets and routing prompts to the closest faucet.
+Layered Signatures Router (LSR) is a prototype CLI for deriving routing embeddings from faucet training datasets and routing prompts to the closest faucet.
 
 The project should run with the VS Code interpreter:
 
@@ -12,12 +12,19 @@ From a terminal:
 
 ```powershell
 conda activate licenta
-cd E:\Licenta\Proiect\semantic-router
+cd E:\Licenta\Proiect\LSR
 ```
 
 ## Project Layout
 
-- `router.py` - CLI implementation
+- `router.py` - thin CLI compatibility entry point
+- `lsr\args.py` - CLI argument definitions
+- `lsr\commands.py` - command orchestration for signing and routing
+- `lsr\dataset.py` - dataset-to-route-text extraction
+- `lsr\devices.py` - processing-unit discovery and selection
+- `lsr\embedding.py` - model loading and embedding helpers
+- `lsr\signatures.py` - signature building, loading, saving, and DER codec
+- `lsr\routing.py` - query expansion and hierarchical search
 - `requirements.txt` - Python dependencies
 - `..\faucets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
 - `..\faucets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
@@ -59,7 +66,7 @@ It contains 104 exam-level records and 347 questions. The dataset keeps training
 
 ## Generate Crypto Signature
 
-The router reads the full dataset and automatically extracts routing text from useful prompt-side fields:
+LSR reads the full dataset and automatically extracts routing text from useful prompt-side fields:
 
 - `topic`
 - `describe`
@@ -90,7 +97,7 @@ python router.py --sign `
 
 ## Layer Rule
 
-Layer sizing is intentionally not exposed as normal CLI tuning. The router uses a fixed geometric rule:
+Layer sizing is intentionally not exposed as normal CLI tuning. LSR uses a fixed geometric rule:
 
 ```text
 L1 = min(128, anchor_count)
@@ -186,6 +193,52 @@ SentenceTransformer(..., local_files_only=True)
 
 Use `--online` only when the model is not already cached and the machine is allowed to download it.
 
+## Serve Mode
+
+For interactive use or integrations, LSR can keep the model and signatures loaded in a local HTTP server:
+
+```powershell
+python router.py --serve `
+  --signatures ..\faucets\signatures `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --PU 1
+```
+
+Health check:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/health
+```
+
+Route one prompt:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8765/route `
+  -ContentType application/json `
+  -Body '{"input":"How can I recover an ECDSA private key if the nonce k is reused?","top_k":1}'
+```
+
+Batch route prompts:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8765/batch `
+  -ContentType application/json `
+  -Body '{"inputs":["How do I verify an RSA signature?","Configure nginx reverse proxy for FastAPI"],"top_k":2}'
+```
+
+Supported endpoints:
+
+- `GET /health` - returns model, signature path, loaded facets, and default `top_k`
+- `POST /route` - accepts `{"input": "..."}`; `prompt` and `text` are also accepted
+- `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts` and `texts` are also accepted
+
+The server uses the same local-only model loading rule as CLI routing. Use `--online` only when the model is not already cached locally.
+
 ## Processing Units
 
 List processing units visible to the router:
@@ -222,7 +275,7 @@ With only one faucet signature, every prompt returns `crypto`; the score is sema
 
 ## Other Supported Dataset Shapes
 
-The router still supports simpler JSON lists:
+LSR still supports simpler JSON lists:
 
 ```json
 [

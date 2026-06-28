@@ -80,7 +80,7 @@ LSR reads the full dataset and automatically extracts routing text from useful p
 It does not embed `solution` as answer text. It may extract short technical keywords from `solution` and `question`, such as `ECDSA`, `nonce`, `POVM`, or `private key`, because those improve routing without training on the full answer.
 
 ```powershell
-python router.py --sign `
+python router.py sign `
   -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
   --signatures ..\faucets\signatures `
   --debug
@@ -89,7 +89,7 @@ python router.py --sign `
 Because the path is under `faucets\Crypto`, the facet name is inferred as `crypto`. You can also pass it explicitly:
 
 ```powershell
-python router.py --sign `
+python router.py sign `
   -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
   --facet crypto `
   --signatures ..\faucets\signatures
@@ -155,21 +155,21 @@ Inside a selected faucet, the router expands the best linked clusters until the 
 Route against all `.sig` files in a signature directory:
 
 ```powershell
-python router.py "How can I recover an ECDSA private key if the nonce k is reused?" `
+python router.py rank "How can I recover an ECDSA private key if the nonce k is reused?" `
   --signatures ..\faucets\signatures
 ```
 
 Route against one specific signature:
 
 ```powershell
-python router.py "How do I verify a DSA signature?" `
+python router.py rank "How do I verify a DSA signature?" `
   --signatures ..\faucets\signatures\crypto.sig
 ```
 
 Input file:
 
 ```powershell
-python router.py -in prompt.txt `
+python router.py rank -in prompt.txt `
   --signatures ..\faucets\signatures `
   --top-k 5
 ```
@@ -177,7 +177,7 @@ python router.py -in prompt.txt `
 Batch route many prompts in one process:
 
 ```powershell
-python router.py --batch --json `
+python router.py rank --batch --json `
   -in ..\router_test_crypto_web_100.json `
   --signatures ..\faucets\signatures `
   --PU 1
@@ -198,7 +198,7 @@ Use `--online` only when the model is not already cached and the machine is allo
 For interactive use or integrations, LSR can keep the model and signatures loaded in a local HTTP server:
 
 ```powershell
-python router.py --serve `
+python router.py serve `
   --signatures ..\faucets\signatures `
   --host 127.0.0.1 `
   --port 8765 `
@@ -216,9 +216,19 @@ Route one prompt:
 ```powershell
 Invoke-RestMethod `
   -Method Post `
-  -Uri http://127.0.0.1:8765/route `
+  -Uri http://127.0.0.1:8765/rank `
   -ContentType application/json `
   -Body '{"input":"How can I recover an ECDSA private key if the nonce k is reused?","top_k":1}'
+```
+
+The same server can be used through the CLI:
+
+```powershell
+python router.py rank `
+  "How can I recover an ECDSA private key if the nonce k is reused?" `
+  --remote `
+  --server http://127.0.0.1:8765 `
+  --top-k 1
 ```
 
 Batch route prompts:
@@ -234,8 +244,20 @@ Invoke-RestMethod `
 Supported endpoints:
 
 - `GET /health` - returns model, signature path, loaded facets, and default `top_k`
-- `POST /route` - accepts `{"input": "..."}`; `prompt` and `text` are also accepted
+- `POST /rank` - accepts `{"input": "..."}`; `prompt` and `text` are also accepted
+- `POST /route` - compatibility alias for `/rank`
 - `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts` and `texts` are also accepted
+- `POST /loadsig` - accepts `{"signatures": "path/to/file-or-directory"}`
+- `POST /unloadsig` - accepts `{"facet": "crypto"}`, `{"facets": ["crypto"]}`, or `{"all": true}`
+
+Signature loading can be controlled through CLI commands while the server is running:
+
+```powershell
+python router.py serve --no-load --host 127.0.0.1 --port 8765 --PU 1
+python router.py loadsig --signatures ..\faucets\signatures --server http://127.0.0.1:8765
+python router.py unloadsig --facet crypto --server http://127.0.0.1:8765
+python router.py unloadsig --all --server http://127.0.0.1:8765
+```
 
 The server uses the same local-only model loading rule as CLI routing. Use `--online` only when the model is not already cached locally.
 
@@ -250,12 +272,12 @@ python router.py --PUs
 Select a processing unit for signing or routing:
 
 ```powershell
-python router.py --sign `
+python router.py sign `
   -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
   --signatures ..\faucets\signatures `
   --PU 1
 
-python router.py "How do I verify an ECDSA signature?" `
+python router.py rank "How do I verify an ECDSA signature?" `
   --signatures ..\faucets\signatures `
   --PU 1
 ```
@@ -305,17 +327,50 @@ For those shapes, routing text uses `text` first, otherwise `instruction + input
 ## CLI Options
 
 ```text
---sign                Generate or update vector signatures
--in, --input PATH     Input file path
---facet NAME          Optional when facet can be inferred from the faucet path
---signatures PATH     .sig file or directory of .sig files, default signatures
---top-k N             Number of routed facets to show, default 3
---batch               Route many prompts from JSON/JSONL/stdin in one process
---json                Print machine-readable JSON output
+python router.py serve [--options]
+python router.py loadsig [--options]
+python router.py unloadsig [--options]
+python router.py sign [--options] [-in dataset.json | "raw text"]
+python router.py rank [--options] [-in prompt.txt | "prompt text"]
+
+Global:
+--PUs                 List available processing units and exit
+
+Common runtime options:
 --model NAME          SentenceTransformer model name
 --online              Allow model downloads/checks; default is local-only
---max-vectors N       Maximum layer-3 vectors stored per faucet, default 10000
---PUs                 List available processing units and exit
 --PU N                Use processing unit index N for embeddings
+
+serve:
+--host HOST           Server host, default 127.0.0.1
+--port N              Server port, default 8765
+--signatures PATH     Initial .sig file or directory of .sig files
+--no-load             Start with no signatures loaded; use loadsig later
+--top-k N             Default number of ranked facets, default 3
+
+loadsig:
+--signatures PATH     .sig file or directory to load into server RAM/VRAM
+--server URL          Server URL, default http://127.0.0.1:8765
+
+unloadsig:
+--facet NAME          Facet to unload; repeatable
+--all                 Unload all signatures
+--server URL          Server URL, default http://127.0.0.1:8765
+
+sign:
+-in, --input PATH     Dataset JSON input
+--facet NAME          Optional when facet can be inferred from the faucet path
+--signatures PATH     Output .sig file or directory
+--max-vectors N       Maximum anchor vectors stored per faucet, default 10000
+--debug               Print extra details
+
+rank:
+-in, --input PATH     Prompt file, or batch input with --batch
+--signatures PATH     .sig file or directory for local ranking
+--top-k N             Number of routed facets to show, default 3
+--batch               Rank many prompts from JSON/JSONL/stdin in one process
+--remote              Send request to running server instead of local model load
+--server URL          Server URL for --remote
+--json                Print machine-readable JSON output
 --debug               Print extra details
 ```

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.error
+import urllib.request
 from typing import Any
 
 from .args import parse_args
@@ -26,17 +28,26 @@ class RouterCLI:
         if self.args.PUs:
             print_processing_units()
             return 0
-        if self.args.sign:
+        if self.args.command == "sign":
             if self.args.input_path:
                 self.sign_dataset()
             else:
                 self.sign_raw_text()
-        elif self.args.serve:
+        elif self.args.command == "serve":
             self.serve()
-        elif self.args.batch:
-            self.route_batch()
+        elif self.args.command == "loadsig":
+            self.loadsig()
+        elif self.args.command == "unloadsig":
+            self.unloadsig()
+        elif self.args.command == "rank":
+            if self.args.remote:
+                self.rank_remote()
+            elif self.args.batch:
+                self.route_batch()
+            else:
+                self.route_prompt()
         else:
-            self.route_prompt()
+            raise RouterError("Missing command. Use serve, loadsig, unloadsig, sign, or rank.")
         return 0
 
     def sign_dataset(self) -> None:
@@ -143,7 +154,49 @@ class RouterCLI:
             pu_index=self.args.PU,
             online=self.args.online,
             default_top_k=self.args.top_k,
+            load_initial_signatures=not self.args.no_load,
         )
+
+    def loadsig(self) -> None:
+        response = post_json(
+            self.args.server,
+            "/loadsig",
+            {"signatures": self.args.signatures},
+        )
+        print(json.dumps(response, ensure_ascii=False))
+
+    def unloadsig(self) -> None:
+        if not self.args.all and not self.args.facet:
+            raise RouterError("unloadsig requires --facet or --all.")
+        response = post_json(
+            self.args.server,
+            "/unloadsig",
+            {"facets": self.args.facet or [], "all": self.args.all},
+        )
+        print(json.dumps(response, ensure_ascii=False))
+
+    def rank_remote(self) -> None:
+        if self.args.batch:
+            raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
+            prompts = load_batch_prompts(raw)
+            response = post_json(
+                self.args.server,
+                "/batch",
+                {"inputs": prompts, "top_k": self.args.top_k},
+            )
+        else:
+            if self.args.input_path:
+                prompt = read_file(self.args.input_path)
+            else:
+                prompt = read_text_arg(self.args.text) or read_stdin_if_available()
+            if not prompt:
+                raise RouterError("Missing prompt. Provide -in input.txt, raw text, or stdin.")
+            response = post_json(
+                self.args.server,
+                "/rank",
+                {"input": prompt, "top_k": self.args.top_k},
+            )
+        print(json.dumps(response, ensure_ascii=False))
 
 
 def print_signature_summary(signatures: list[FacetSignature]) -> None:
@@ -225,6 +278,28 @@ def route_prompt(args: argparse.Namespace) -> None:
 
 def route_batch(args: argparse.Namespace) -> None:
     RouterCLI(args).route_batch()
+
+
+def post_json(server_url: str, path: str, payload: Any) -> Any:
+    base_url = server_url.rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {"error": body or exc.reason}
+        raise RouterError(str(data.get("error") or data)) from exc
+    except urllib.error.URLError as exc:
+        raise RouterError(f"Cannot reach LSR server at {server_url}: {exc.reason}") from exc
 
 
 def main() -> int:

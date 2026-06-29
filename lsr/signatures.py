@@ -20,12 +20,20 @@ class SignatureCodec:
 
     def save(self, path: str | Path, signature: LayeredSignature, model_name: str | None = None) -> Path:
         signature_path = signature_output_path(path, signature.facet)
-        active_model_name = model_name or self.model_name or ""
+        active_model_name = model_name or signature.model_name or self.model_name or ""
+        active_model_hash = signature.model_hash or model_hash(active_model_name)
+        active_normalize = signature.normalize
+        active_distance_metric = signature.distance_metric or "cosine"
         layers = [signature.layers[level] for level in sorted(signature.layers)]
         payload = der_sequence(
             der_integer(SIGNATURE_VERSION),
-            der_octet_string(model_hash(active_model_name)),
-            der_integer(signature.dimension),
+            encode_metadata(
+                model_name=active_model_name,
+                model_hash_value=active_model_hash,
+                dimension=signature.dimension,
+                normalize=active_normalize,
+                distance_metric=active_distance_metric,
+            ),
             der_sequence(*(self.encode_layer(layer) for layer in layers)),
         )
         signature_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,10 +50,14 @@ class SignatureCodec:
 
         root = DerReader(raw).read_sequence()
         version = root.read_integer()
-        if version != SIGNATURE_VERSION:
+        if version == 2:
+            metadata = self.decode_legacy_metadata(root)
+        elif version == SIGNATURE_VERSION:
+            metadata = decode_metadata(root.read_sequence())
+        else:
             raise RouterError(f"Unsupported signature version {version} in {path}")
-        root.read_octet_string()
-        dimension = root.read_integer()
+
+        dimension = int(metadata["dimension"])
         layers_reader = root.read_sequence()
 
         layers: dict[int, SignatureLayer] = {}
@@ -55,7 +67,15 @@ class SignatureCodec:
 
         if not layers:
             raise RouterError(f"Signature does not contain any layers: {path}")
-        return LayeredSignature(facet=path.stem.lower(), dimension=dimension, layers=layers)
+        return LayeredSignature(
+            facet=path.stem.lower(),
+            dimension=dimension,
+            layers=layers,
+            model_name=str(metadata["model_name"]),
+            model_hash=metadata["model_hash"],
+            normalize=bool(metadata["normalize"]),
+            distance_metric=str(metadata["distance_metric"]),
+        )
 
     def encode_layer(self, layer: SignatureLayer) -> bytes:
         items = [
@@ -75,6 +95,17 @@ class SignatureCodec:
             links = decode_links(layer_reader)
         return SignatureLayer(level=level, vectors=vectors, links=links)
 
+    def decode_legacy_metadata(self, root: DerReader) -> dict[str, Any]:
+        model_hash_value = root.read_octet_string()
+        dimension = root.read_integer()
+        return {
+            "model_name": self.model_name or "",
+            "model_hash": model_hash_value,
+            "dimension": dimension,
+            "normalize": True,
+            "distance_metric": "cosine",
+        }
+
     def _load_legacy_json_signature(self, path: Path, raw: bytes) -> LayeredSignature:
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -88,6 +119,10 @@ class SignatureCodec:
             facet=path.stem.lower(),
             dimension=int(matrix.shape[1]),
             layers={1: SignatureLayer(level=1, vectors=matrix, links=[])},
+            model_name=self.model_name or "",
+            model_hash=model_hash(self.model_name or ""),
+            normalize=True,
+            distance_metric="cosine",
         )
 
 
@@ -162,7 +197,13 @@ class SignatureBuilder:
                 links=parent_links,
             )
 
-        return LayeredSignature(facet=facet, dimension=int(dimension), layers=layers)
+        return LayeredSignature(
+            facet=facet,
+            dimension=int(dimension),
+            layers=layers,
+            normalize=True,
+            distance_metric="cosine",
+        )
 
 
 def matrix_to_octets(matrix: Any) -> bytes:
@@ -209,6 +250,43 @@ def decode_links(reader: DerReader) -> list[list[int]]:
             links.append([])
         links[parent_id] = child_ids
     return links
+
+
+def encode_metadata(
+    model_name: str,
+    model_hash_value: bytes,
+    dimension: int,
+    normalize: bool,
+    distance_metric: str,
+) -> bytes:
+    return der_sequence(
+        der_octet_string(model_name.encode("utf-8")),
+        der_octet_string(model_hash_value),
+        der_integer(dimension),
+        der_integer(1 if normalize else 0),
+        der_octet_string(distance_metric.encode("utf-8")),
+    )
+
+
+def decode_metadata(reader: DerReader) -> dict[str, Any]:
+    model_name = reader.read_octet_string().decode("utf-8")
+    model_hash_value = reader.read_octet_string()
+    dimension = reader.read_integer()
+    normalize = bool(reader.read_integer())
+    distance_metric = reader.read_octet_string().decode("utf-8")
+    if reader.remaining():
+        raise RouterError("Unexpected extra fields in signature metadata.")
+    if dimension <= 0:
+        raise RouterError("Invalid signature metadata dimension.")
+    if not distance_metric:
+        raise RouterError("Signature metadata is missing distanceMetric.")
+    return {
+        "model_name": model_name,
+        "model_hash": model_hash_value,
+        "dimension": dimension,
+        "normalize": normalize,
+        "distance_metric": distance_metric,
+    }
 
 
 def model_hash(model_name: str) -> bytes:

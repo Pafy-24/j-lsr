@@ -15,32 +15,6 @@ from .dependencies import ensure_numpy
 from .errors import RouterError
 from .models import LayeredSignature
 
-QUERY_EXPANSIONS = {
-    "ecdsa": "elliptic curve digital signature algorithm repeated nonce k private key recovery r s signature",
-    "dsa": "digital signature algorithm nonce k private key recovery signature",
-    "rsa": "rsa public key private key signature verification encryption modulus exponent",
-    "nonce": "reused repeated nonce ephemeral secret k signature private key recovery",
-    "private key": "secret key recovery cryptographic attack",
-    "signature": "digital signature verification signing public key private key",
-    "aes": "advanced encryption standard block cipher symmetric encryption",
-}
-
-
-class QueryExpander:
-    def __init__(self, expansions: dict[str, str] | None = None):
-        self.expansions = expansions or QUERY_EXPANSIONS
-
-    def expand(self, prompt: str) -> str:
-        lowered = prompt.lower()
-        expansions = [
-            expansion
-            for trigger, expansion in self.expansions.items()
-            if trigger in lowered
-        ]
-        if not expansions:
-            return prompt
-        return f"{prompt}\n\nExpanded technical context: {' '.join(expansions)}"
-
 
 class LSRRouter:
     def __init__(self, signatures: dict[str, LayeredSignature], top_k: int = 3):
@@ -49,7 +23,7 @@ class LSRRouter:
         self.signatures = signatures
         self.top_k = top_k
 
-    def route(self, prompt: str, routed_prompt: str, prompt_embedding: Any) -> dict[str, Any]:
+    def route(self, prompt: str, prompt_embedding: Any) -> dict[str, Any]:
         coarse_results = [
             self.coarse_search_signature(signature, prompt_embedding)
             for signature in self.signatures.values()
@@ -70,7 +44,6 @@ class LSRRouter:
         results.sort(key=lambda item: item["score"], reverse=True)
         return {
             "input": prompt,
-            "expanded": routed_prompt if routed_prompt != prompt else None,
             "results": results[: self.top_k],
             "compared_facets": len(results),
             "deep_facets": sorted(deep_facets),
@@ -166,10 +139,6 @@ class LSRRouter:
         return select_deep_facets(coarse_results, self.top_k)
 
 
-def expand_query(prompt: str) -> str:
-    return QueryExpander().expand(prompt)
-
-
 def child_ids(links: list[list[int]], parent_ids: list[int], max_items: int | None = None) -> list[int]:
     ids: list[int] = []
     seen: set[int] = set()
@@ -244,20 +213,18 @@ def search_signature(signature: LayeredSignature, prompt_embedding: Any, args: A
 
 def route_embedding(
     prompt: str,
-    routed_prompt: str,
     prompt_embedding: Any,
     signatures: dict[str, LayeredSignature],
     args: Any,
 ) -> dict[str, Any]:
     return LSRRouter(signatures, getattr(args, "top_k", 3)).route(
-        prompt, routed_prompt, prompt_embedding
+        prompt, prompt_embedding
     )
 
 
 def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
     return {
         "input": route["input"],
-        "expanded": route["expanded"],
         "compared_facets": route["compared_facets"],
         "deep_facets": route["deep_facets"],
         "results": [

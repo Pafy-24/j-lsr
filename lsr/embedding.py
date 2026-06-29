@@ -5,6 +5,7 @@ from typing import Any
 
 from .dependencies import ensure_numpy, get_sentence_transformer_class
 from .devices import select_processing_unit
+from .errors import RouterError
 
 
 def normalize_matrix(matrix: Any) -> Any:
@@ -43,9 +44,17 @@ class EmbeddingService:
         unit = select_processing_unit(self.pu_index)
         sentence_transformer_class = get_sentence_transformer_class()
         kwargs = {"local_files_only": not self.online}
-        if unit is None:
-            return sentence_transformer_class(self.model_name, **kwargs)
-        return sentence_transformer_class(self.model_name, device=unit.device, **kwargs)
+        try:
+            if unit is None:
+                return sentence_transformer_class(self.model_name, **kwargs)
+            return sentence_transformer_class(self.model_name, device=unit.device, **kwargs)
+        except OSError as exc:
+            if not self.online:
+                raise RouterError(
+                    f"Model not found in local cache: {self.model_name}. "
+                    "Run once with --online to download/cache it, or pass --model with a local model path."
+                ) from exc
+            raise RouterError(f"Could not load model {self.model_name}: {exc}") from exc
 
 
 def embed_texts(model: Any, texts: list[str]) -> Any:

@@ -15,7 +15,7 @@ from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .io_utils import load_batch_prompts, load_dataset, read_file, read_stdin_if_available, read_text_arg
 from .models import FacetSignature
-from .routing import LSRRouter, expand_query, json_ready_route
+from .routing import LSRRouter, json_ready_route
 from .server import serve
 from .signatures import SignatureBuilder, SignatureStore
 
@@ -40,12 +40,12 @@ class RouterCLI:
         elif self.args.command == "unloadsig":
             self.unloadsig()
         elif self.args.command == "rank":
-            if self.args.remote:
-                self.rank_remote()
-            elif self.args.batch:
+            if self.args.local and self.args.batch:
                 self.route_batch()
-            else:
+            elif self.args.local:
                 self.route_prompt()
+            else:
+                self.rank_remote()
         else:
             raise RouterError("Missing command. Use serve, loadsig, unloadsig, sign, or rank.")
         return 0
@@ -110,11 +110,8 @@ class RouterCLI:
             raise RouterError("Missing prompt. Provide -in input.txt, raw text, or stdin.")
 
         model = load_model(self.args.model, self.args.PU, self.args.online)
-        routed_prompt = expand_query(prompt)
-        prompt_embedding = embed_texts(model, [routed_prompt])[0]
-        route = LSRRouter(signatures, self.args.top_k).route(
-            prompt, routed_prompt, prompt_embedding
-        )
+        prompt_embedding = embed_texts(model, [prompt])[0]
+        route = LSRRouter(signatures, self.args.top_k).route(prompt, prompt_embedding)
 
         if self.args.json:
             print(json.dumps(json_ready_route(route), ensure_ascii=False))
@@ -130,21 +127,19 @@ class RouterCLI:
 
         raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
         prompts = load_batch_prompts(raw)
-        routed_prompts = [expand_query(prompt) for prompt in prompts]
-
         model = load_model(self.args.model, self.args.PU, self.args.online)
-        embeddings = embed_texts(model, routed_prompts)
+        embeddings = embed_texts(model, prompts)
         router = LSRRouter(signatures, self.args.top_k)
         routes = [
-            router.route(prompt, routed_prompt, embeddings[index])
-            for index, (prompt, routed_prompt) in enumerate(zip(prompts, routed_prompts))
+            router.route(prompt, embeddings[index])
+            for index, prompt in enumerate(prompts)
         ]
         print(json.dumps([json_ready_route(route) for route in routes], ensure_ascii=False))
 
     def serve(self) -> None:
         console.print(
-            f"Starting LSR server on [bold]{self.args.host}:{self.args.port}[/bold] "
-            f"with signatures [bold]{self.args.signatures}[/bold]"
+            f"Starting LSR server on {self.args.host}:{self.args.port} "
+            f"with signatures {self.args.signatures}"
         )
         serve(
             host=self.args.host,
@@ -196,7 +191,10 @@ class RouterCLI:
                 "/rank",
                 {"input": prompt, "top_k": self.args.top_k},
             )
-        print(json.dumps(response, ensure_ascii=False))
+        if self.args.batch or self.args.json:
+            print(json.dumps(response, ensure_ascii=False))
+        else:
+            print_route_table(response, self.args)
 
 
 def print_signature_summary(signatures: list[FacetSignature]) -> None:
@@ -246,10 +244,7 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
 
     if args.debug:
         prompt = route["input"]
-        routed_prompt = route["expanded"] or prompt
         console.print(f"[dim]Prompt: {prompt}[/dim]")
-        if routed_prompt != prompt:
-            console.print(f"[dim]Expanded: {routed_prompt}[/dim]")
         console.print(f"[dim]Model: {args.model}[/dim]")
         if args.PU is not None:
             unit = select_processing_unit(args.PU)
@@ -280,7 +275,7 @@ def route_batch(args: argparse.Namespace) -> None:
     RouterCLI(args).route_batch()
 
 
-def post_json(server_url: str, path: str, payload: Any) -> Any:
+def post_json(server_url: str, path: str, payload: Any, timeout: int = 60) -> Any:
     base_url = server_url.rstrip("/")
     request = urllib.request.Request(
         f"{base_url}{path}",
@@ -289,7 +284,7 @@ def post_json(server_url: str, path: str, payload: Any) -> Any:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")

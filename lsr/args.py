@@ -132,7 +132,12 @@ def parse_args() -> argparse.Namespace:
     rank.add_argument(
         "--remote",
         action="store_true",
-        help="Send the rank request to --server instead of loading model/signatures locally.",
+        help="Compatibility option; ranking uses --server by default.",
+    )
+    rank.add_argument(
+        "--local",
+        action="store_true",
+        help="Load model/signatures locally instead of using the running server.",
     )
     rank.add_argument("--debug", action="store_true", help="Print extra details.")
 

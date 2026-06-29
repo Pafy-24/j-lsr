@@ -78,8 +78,8 @@ def infer_facet_from_paths(
         path = Path(raw_path)
         parts = list(path.parts)
         lowered = [part.lower() for part in parts]
-        if "faucets" in lowered:
-            index = lowered.index("faucets")
+        if "facets" in lowered:
+            index = lowered.index("facets")
             if index + 1 < len(parts):
                 return parts[index + 1].strip().lower()
         if path.suffix.lower() == ".sig" and path.stem:
@@ -87,7 +87,7 @@ def infer_facet_from_paths(
 
     raise RouterError(
         "Dataset items do not define a facet and no facet could be inferred. "
-        "Pass --facet crypto or use a path under faucets\\Crypto."
+        "Pass --facet crypto or use a path under facets\\Crypto."
     )
 
 

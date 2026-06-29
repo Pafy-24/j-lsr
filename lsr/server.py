@@ -5,10 +5,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from .console import console
 from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .models import LayeredSignature
-from .routing import LSRRouter, expand_query, json_ready_route
+from .routing import LSRRouter, json_ready_route
 from .signatures import SignatureStore
 
 
@@ -20,6 +21,7 @@ class LSRRouteService:
         pu_index: int | None,
         online: bool,
         default_top_k: int,
+        load_initial_signatures: bool = True,
     ):
         if default_top_k < 1:
             raise RouterError("--top-k must be at least 1.")
@@ -27,7 +29,7 @@ class LSRRouteService:
         self.model_name = model_name
         self.default_top_k = default_top_k
         self.signatures: dict[str, LayeredSignature] = {}
-        if signatures_path:
+        if signatures_path and load_initial_signatures:
             self.load_signatures(signatures_path, required=True)
         self.model = load_model(model_name, pu_index, online)
 
@@ -38,6 +40,16 @@ class LSRRouteService:
             "model": self.model_name,
             "signatures": self.signatures_path,
             "facets": sorted(self.signatures),
+            "facet_metadata": {
+                facet: {
+                    "modelName": signature.model_name,
+                    "modelHash": signature.model_hash.hex(),
+                    "dimension": signature.dimension,
+                    "normalize": signature.normalize,
+                    "distanceMetric": signature.distance_metric,
+                }
+                for facet, signature in sorted(self.signatures.items())
+            },
             "default_top_k": self.default_top_k,
         }
 
@@ -82,11 +94,8 @@ class LSRRouteService:
         if not self.signatures:
             raise RouterError("No signatures loaded. Use loadsig first.")
         active_top_k = self._top_k(top_k)
-        routed_prompt = expand_query(prompt)
-        prompt_embedding = embed_texts(self.model, [routed_prompt])[0]
-        route = LSRRouter(self.signatures, active_top_k).route(
-            prompt, routed_prompt, prompt_embedding
-        )
+        prompt_embedding = embed_texts(self.model, [prompt])[0]
+        route = LSRRouter(self.signatures, active_top_k).route(prompt, prompt_embedding)
         return json_ready_route(route)
 
     def route_batch(self, prompts: list[str], top_k: int | None = None) -> list[dict[str, Any]]:
@@ -99,12 +108,11 @@ class LSRRouteService:
             if not prompt:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
-        routed_prompts = [expand_query(prompt) for prompt in cleaned]
-        embeddings = embed_texts(self.model, routed_prompts)
+        embeddings = embed_texts(self.model, cleaned)
         router = LSRRouter(self.signatures, active_top_k)
         return [
-            json_ready_route(router.route(prompt, routed_prompt, embeddings[index]))
-            for index, (prompt, routed_prompt) in enumerate(zip(cleaned, routed_prompts))
+            json_ready_route(router.route(prompt, embeddings[index]))
+            for index, prompt in enumerate(cleaned)
         ]
 
     def _top_k(self, top_k: int | None) -> int:
@@ -255,13 +263,18 @@ def serve(
     load_initial_signatures: bool = True,
 ) -> None:
     service = LSRRouteService(
-        signatures_path=signatures_path if load_initial_signatures else "",
+        signatures_path=signatures_path,
         model_name=model_name,
         pu_index=pu_index,
         online=online,
         default_top_k=default_top_k,
+        load_initial_signatures=load_initial_signatures,
     )
     server = LSRHTTPServer((host, port), service)
+    console.print(
+        f"LSR server ready on http://{host}:{port} "
+        f"with facets: {', '.join(service.health()['facets']) or 'none'}"
+    )
     try:
         server.serve_forever()
     finally:

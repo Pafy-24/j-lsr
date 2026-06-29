@@ -26,8 +26,8 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\signatures.py` - signature building, loading, saving, and DER codec
 - `lsr\routing.py` - query expansion and hierarchical search
 - `requirements.txt` - Python dependencies
-- `..\faucets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
-- `..\faucets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
+- `..\facets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
+- `..\facets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
 
 There is no `signatures.json` in the active flow. A faucet signature is stored as:
 
@@ -40,9 +40,16 @@ The `.sig` file is binary ASN.1 DER. It contains:
 ```text
 FacetSignature ::= SEQUENCE {
   version     INTEGER,
+  metadata    Metadata,
+  layers      SEQUENCE OF Layer
+}
+
+Metadata ::= SEQUENCE {
+  modelName      OCTET STRING,
   modelHash   OCTET STRING,
   dimension   INTEGER,
-  layers      SEQUENCE OF Layer
+  normalize      INTEGER,
+  distanceMetric OCTET STRING
 }
 
 Layer ::= SEQUENCE {
@@ -81,18 +88,18 @@ It does not embed `solution` as answer text. It may extract short technical keyw
 
 ```powershell
 python router.py sign `
-  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
-  --signatures ..\faucets\signatures `
+  -in ..\facets\Crypto\datasets\train\crypto_dataset.json `
+  --signatures ..\facets\signatures `
   --debug
 ```
 
-Because the path is under `faucets\Crypto`, the facet name is inferred as `crypto`. You can also pass it explicitly:
+Because the path is under `facets\Crypto`, the facet name is inferred as `crypto`. You can also pass it explicitly:
 
 ```powershell
 python router.py sign `
-  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
+  -in ..\facets\Crypto\datasets\train\crypto_dataset.json `
   --facet crypto `
-  --signatures ..\faucets\signatures
+  --signatures ..\facets\signatures
 ```
 
 ## Layer Rule
@@ -105,7 +112,7 @@ L(n+1) = min(anchor_count, L(n) * 10)
 stop when L(n) == anchor_count
 ```
 
-That gives a stable top-level comparison cost while allowing larger faucets to grow deeper:
+That gives a stable top-level comparison cost while allowing larger facets to grow deeper:
 
 ```text
 977 anchors    -> L1=128, L2=977
@@ -133,7 +140,7 @@ L2 = 977 anchor vectors
 The signature is written to:
 
 ```text
-..\faucets\signatures\crypto.sig
+..\facets\signatures\crypto.sig
 ```
 
 ## Descend Policy
@@ -142,10 +149,10 @@ Routing does not send every faucet to the deepest layer.
 
 ```text
 1. score every faucet on L1 only
-2. always descend at least the top-k L1 faucets
-3. also descend near-tie faucets if:
+2. always descend at least the top-k L1 facets
+3. also descend near-tie facets if:
    score >= 0.18 and score >= best_l1_score - 0.08
-4. never descend more than 8 faucets per query
+4. never descend more than 8 facets per query
 ```
 
 Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
@@ -155,22 +162,23 @@ Inside a selected faucet, the router expands the best linked clusters until the 
 Route against all `.sig` files in a signature directory:
 
 ```powershell
-python router.py rank "How can I recover an ECDSA private key if the nonce k is reused?" `
-  --signatures ..\faucets\signatures
+python router.py rank "How can I recover an ECDSA private key if the nonce k is reused?"
 ```
 
-Route against one specific signature:
+`rank` uses the running server by default, so it ranks against the signatures already loaded by `serve` or `loadsig`.
+
+For an ad-hoc local rank against one specific signature, bypass the server explicitly:
 
 ```powershell
 python router.py rank "How do I verify a DSA signature?" `
-  --signatures ..\faucets\signatures\crypto.sig
+  --local `
+  --signatures ..\facets\signatures\crypto.sig
 ```
 
 Input file:
 
 ```powershell
 python router.py rank -in prompt.txt `
-  --signatures ..\faucets\signatures `
   --top-k 5
 ```
 
@@ -179,11 +187,10 @@ Batch route many prompts in one process:
 ```powershell
 python router.py rank --batch --json `
   -in ..\router_test_crypto_web_100.json `
-  --signatures ..\faucets\signatures `
-  --PU 1
+  --top-k 3
 ```
 
-Batch mode loads the model and signatures once, embeds all prompts together, and emits JSON. This is the preferred mode for evaluation and bulk routing.
+Batch mode sends one HTTP request to the running server, which embeds all prompts together and emits JSON. This is the preferred mode for evaluation and bulk routing.
 
 By default, model loading is local-only:
 
@@ -199,7 +206,7 @@ For interactive use or integrations, LSR can keep the model and signatures loade
 
 ```powershell
 python router.py serve `
-  --signatures ..\faucets\signatures `
+  --signatures ..\facets\signatures `
   --host 127.0.0.1 `
   --port 8765 `
   --PU 1
@@ -226,7 +233,6 @@ The same server can be used through the CLI:
 ```powershell
 python router.py rank `
   "How can I recover an ECDSA private key if the nonce k is reused?" `
-  --remote `
   --server http://127.0.0.1:8765 `
   --top-k 1
 ```
@@ -254,12 +260,22 @@ Signature loading can be controlled through CLI commands while the server is run
 
 ```powershell
 python router.py serve --no-load --host 127.0.0.1 --port 8765 --PU 1
-python router.py loadsig --signatures ..\faucets\signatures --server http://127.0.0.1:8765
+python router.py loadsig --signatures ..\facets\signatures --server http://127.0.0.1:8765
 python router.py unloadsig --facet crypto --server http://127.0.0.1:8765
 python router.py unloadsig --all --server http://127.0.0.1:8765
 ```
 
+Signing remains a CLI operation. After generating or updating `.sig` files, run `loadsig` or restart `serve` if the running server should use the new signatures.
+
 The server uses the same local-only model loading rule as CLI routing. Use `--online` only when the model is not already cached locally.
+
+First run on a fresh environment:
+
+```powershell
+python router.py serve --signatures ..\facets\signatures --online
+```
+
+After the model is cached, omit `--online`.
 
 ## Processing Units
 
@@ -273,13 +289,17 @@ Select a processing unit for signing or routing:
 
 ```powershell
 python router.py sign `
-  -in ..\faucets\Crypto\datasets\train\crypto_dataset.json `
-  --signatures ..\faucets\signatures `
+  -in ..\facets\Crypto\datasets\train\crypto_dataset.json `
+  --signatures ..\facets\signatures `
+  --PU 1
+```
+
+```powershell
+python router.py serve `
+  --signatures ..\facets\signatures `
   --PU 1
 
-python router.py rank "How do I verify an ECDSA signature?" `
-  --signatures ..\faucets\signatures `
-  --PU 1
+python router.py rank "How do I verify an ECDSA signature?"
 ```
 
 `--PUs` always includes CPU index `0`. It also reports GPUs/NPUs detected by Windows even when the current Python backend cannot use them. The `Usable` column tells whether `--PU <index>` can actually be used for embeddings.
@@ -339,7 +359,7 @@ Global:
 Common runtime options:
 --model NAME          SentenceTransformer model name
 --online              Allow model downloads/checks; default is local-only
---PU N                Use processing unit index N for embeddings
+--PU N                Use processing unit index N for local embeddings or serve
 
 serve:
 --host HOST           Server host, default 127.0.0.1
@@ -366,11 +386,12 @@ sign:
 
 rank:
 -in, --input PATH     Prompt file, or batch input with --batch
---signatures PATH     .sig file or directory for local ranking
+--signatures PATH     .sig file or directory for --local ranking
 --top-k N             Number of routed facets to show, default 3
 --batch               Rank many prompts from JSON/JSONL/stdin in one process
---remote              Send request to running server instead of local model load
---server URL          Server URL for --remote
+--server URL          Server URL, default http://127.0.0.1:8765
+--local               Load model/signatures locally instead of using serve
+--remote              Compatibility option; server mode is already the default
 --json                Print machine-readable JSON output
 --debug               Print extra details
 ```

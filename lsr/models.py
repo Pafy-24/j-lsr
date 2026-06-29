@@ -29,6 +29,10 @@ class LayeredSignature:
     facet: str
     dimension: int
     layers: dict[int, SignatureLayer]
+    model_name: str = ""
+    model_hash: bytes = b""
+    normalize: bool = True
+    distance_metric: str = "cosine"
 
 
 @dataclass

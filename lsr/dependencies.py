@@ -7,6 +7,7 @@ from .errors import RouterError
 np = None
 SentenceTransformer = None
 MiniBatchKMeans = None
+faiss = None
 
 
 def ensure_numpy() -> Any:
@@ -44,6 +45,20 @@ def get_kmeans_class() -> Any:
             ) from exc
         MiniBatchKMeans = minibatch_kmeans_class
     return MiniBatchKMeans
+
+
+def ensure_faiss() -> Any:
+    global faiss
+    if faiss is None:
+        try:
+            import faiss as faiss_module
+        except ModuleNotFoundError as exc:  # pragma: no cover - depends on env
+            raise RouterError(
+                "Missing dependency: faiss-cpu. "
+                "Install dependencies with: pip install -r requirements.txt"
+            ) from exc
+        faiss = faiss_module
+    return faiss
 
 
 def make_table(*args: Any, **kwargs: Any) -> Any:

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import argparse
 
-from .config import DEFAULT_MAX_VECTORS, DEFAULT_MODEL, DEFAULT_SIGNATURES
+from .config import (
+    DEFAULT_MAX_VECTORS,
+    DEFAULT_MODEL,
+    DEFAULT_SIGNATURES,
+    LAYER_ACCEPT_THRESHOLD,
+    LAYER_DESCEND_THRESHOLD,
+)
 
 
 def add_runtime_options(parser: argparse.ArgumentParser) -> None:
@@ -18,8 +24,37 @@ def add_runtime_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--PU",
-        type=int,
         help="Processing unit index to use for embedding operations. See --PUs.",
+    )
+
+
+def add_index_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--index",
+        choices=("auto", "flat", "hnsw"),
+        default="auto",
+        help="Vector index backend. Default: auto",
+    )
+
+
+def add_loading_policy_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--memory-limit-mb",
+        type=float,
+        default=0.0,
+        help="Maximum signature vector memory kept warm. 0 means unlimited. Default: 0",
+    )
+    parser.add_argument(
+        "--descend-threshold",
+        type=float,
+        default=LAYER_DESCEND_THRESHOLD,
+        help=f"Minimum layer score needed to continue deeper. Default: {LAYER_DESCEND_THRESHOLD}",
+    )
+    parser.add_argument(
+        "--accept-threshold",
+        type=float,
+        default=LAYER_ACCEPT_THRESHOLD,
+        help=f"Layer score that accepts a facet without deeper comparison. Default: {LAYER_ACCEPT_THRESHOLD}",
     )
 
 
@@ -61,6 +96,8 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(serve)
     add_runtime_options(serve)
+    add_index_option(serve)
+    add_loading_policy_options(serve)
     serve.add_argument("--host", default="127.0.0.1", help="Host address. Default: 127.0.0.1")
     serve.add_argument("--port", type=int, default=8765, help="Port. Default: 8765")
     serve.add_argument("--top-k", type=int, default=3, help="Default result count. Default: 3")
@@ -125,6 +162,8 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(rank)
     add_runtime_options(rank)
+    add_index_option(rank)
+    add_loading_policy_options(rank)
     add_server_target_option(rank)
     rank.add_argument("--top-k", type=int, default=3, help="Number of facets to return. Default: 3")
     rank.add_argument("--batch", action="store_true", help="Rank multiple prompts.")
@@ -140,5 +179,43 @@ def parse_args() -> argparse.Namespace:
         help="Load model/signatures locally instead of using the running server.",
     )
     rank.add_argument("--debug", action="store_true", help="Print extra details.")
+
+    benchmark = subparsers.add_parser(
+        "benchmark-models",
+        help="Benchmark candidate embedding models on a labeled prompt set.",
+    )
+    benchmark.add_argument(
+        "-in",
+        "--input",
+        dest="input_path",
+        default="../router_test_crypto_web_100.json",
+        help="Benchmark input JSON/JSONL/text file. Default: ../router_test_crypto_web_100.json",
+    )
+    add_signature_path_option(benchmark)
+    benchmark.add_argument(
+        "--models",
+        default="sentence-transformers/all-MiniLM-L6-v2,thenlper/gte-small",
+        help="Comma-separated model names to benchmark.",
+    )
+    benchmark.add_argument(
+        "--output",
+        help="Optional JSON output path for benchmark results.",
+    )
+    benchmark.add_argument(
+        "--dataset",
+        default="../facets/Crypto/datasets/train/crypto_dataset.json",
+        help="Training dataset used to build temporary signatures per model.",
+    )
+    benchmark.add_argument("--facet", help="Facet name for benchmark dataset if it cannot be inferred.")
+    benchmark.add_argument(
+        "--max-vectors",
+        type=int,
+        default=DEFAULT_MAX_VECTORS,
+        help=f"Maximum anchor vectors per temporary benchmark signature. Default: {DEFAULT_MAX_VECTORS}",
+    )
+    benchmark.add_argument("--online", action="store_true", help="Allow model downloads/checks.")
+    benchmark.add_argument("--PU", help="Processing unit index or auto. See --PUs.")
+    add_index_option(benchmark)
+    add_loading_policy_options(benchmark)
 
     return parser.parse_args()

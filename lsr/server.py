@@ -8,6 +8,7 @@ from typing import Any
 from .console import console
 from .embedding import embed_texts, load_model
 from .errors import RouterError
+from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import LayeredSignature
 from .routing import LSRRouter, json_ready_route
 from .signatures import SignatureStore
@@ -21,23 +22,55 @@ class LSRRouteService:
         pu_index: int | None,
         online: bool,
         default_top_k: int,
+        index_policy: str = "auto",
+        memory_limit_mb: float = 0.0,
+        descend_threshold: float = 0.18,
+        accept_threshold: float = 0.82,
         load_initial_signatures: bool = True,
     ):
         if default_top_k < 1:
             raise RouterError("--top-k must be at least 1.")
         self.signatures_path = signatures_path
-        self.model_name = model_name
+        self.requested_model_name = model_name
         self.default_top_k = default_top_k
+        self.index_policy = index_policy
+        self.memory_limit_mb = memory_limit_mb
+        self.descend_threshold = descend_threshold
+        self.accept_threshold = accept_threshold
         self.signatures: dict[str, LayeredSignature] = {}
+        self.model_name = model_name
         if signatures_path and load_initial_signatures:
             self.load_signatures(signatures_path, required=True)
-        self.model = load_model(model_name, pu_index, online)
+        self.model_name = resolve_model_name(model_name, self.signatures)
+        validate_signature_model_compatibility(self.model_name, self.signatures)
+        self.model = load_model(self.model_name, pu_index, online)
+        self.router = self.build_router(default_top_k)
+
+    def build_router(self, top_k: int) -> LSRRouter:
+        return LSRRouter(
+            self.signatures,
+            top_k,
+            index_policy=self.index_policy,
+            model_name=self.model_name,
+            memory_limit_mb=self.memory_limit_mb,
+            descend_threshold=self.descend_threshold,
+            accept_threshold=self.accept_threshold,
+        )
 
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
             "service": "LSR",
             "model": self.model_name,
+            "requested_model": self.requested_model_name,
+            "index_policy": self.index_policy,
+            "index_backend": self.router.index_backend_label(),
+            "loading_policy": self.router.loading_policy_label(),
+            "memory_limit_mb": self.memory_limit_mb,
+            "thresholds": {
+                "descend": self.descend_threshold,
+                "accept": self.accept_threshold,
+            },
             "signatures": self.signatures_path,
             "facets": sorted(self.signatures),
             "facet_metadata": {
@@ -55,8 +88,12 @@ class LSRRouteService:
 
     def load_signatures(self, path: str, required: bool = True) -> dict[str, Any]:
         loaded = SignatureStore(path).load_all(required=required)
+        if getattr(self, "model_name", "auto") != "auto":
+            validate_signature_model_compatibility(self.model_name, loaded)
         self.signatures.update(loaded)
         self.signatures_path = path
+        if hasattr(self, "router"):
+            self.router = self.build_router(self.default_top_k)
         return {
             "loaded": sorted(loaded),
             "facets": sorted(self.signatures),
@@ -68,6 +105,7 @@ class LSRRouteService:
         if unload_all:
             removed = sorted(self.signatures)
             self.signatures.clear()
+            self.router = self.build_router(self.default_top_k)
             return {"unloaded": removed, "facets": []}
         if not facets:
             raise RouterError("Provide facets or all=true.")
@@ -81,6 +119,7 @@ class LSRRouteService:
                 removed.append(key)
             else:
                 missing.append(key)
+        self.router = self.build_router(self.default_top_k)
         return {
             "unloaded": removed,
             "missing": missing,
@@ -95,7 +134,7 @@ class LSRRouteService:
             raise RouterError("No signatures loaded. Use loadsig first.")
         active_top_k = self._top_k(top_k)
         prompt_embedding = embed_texts(self.model, [prompt])[0]
-        route = LSRRouter(self.signatures, active_top_k).route(prompt, prompt_embedding)
+        route = self.router.route(prompt, prompt_embedding, active_top_k)
         return json_ready_route(route)
 
     def route_batch(self, prompts: list[str], top_k: int | None = None) -> list[dict[str, Any]]:
@@ -109,9 +148,8 @@ class LSRRouteService:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
         embeddings = embed_texts(self.model, cleaned)
-        router = LSRRouter(self.signatures, active_top_k)
         return [
-            json_ready_route(router.route(prompt, embeddings[index]))
+            json_ready_route(self.router.route(prompt, embeddings[index], active_top_k))
             for index, prompt in enumerate(cleaned)
         ]
 
@@ -260,6 +298,10 @@ def serve(
     pu_index: int | None,
     online: bool,
     default_top_k: int,
+    index_policy: str = "auto",
+    memory_limit_mb: float = 0.0,
+    descend_threshold: float = 0.18,
+    accept_threshold: float = 0.82,
     load_initial_signatures: bool = True,
 ) -> None:
     service = LSRRouteService(
@@ -268,6 +310,10 @@ def serve(
         pu_index=pu_index,
         online=online,
         default_top_k=default_top_k,
+        index_policy=index_policy,
+        memory_limit_mb=memory_limit_mb,
+        descend_threshold=descend_threshold,
+        accept_threshold=accept_threshold,
         load_initial_signatures=load_initial_signatures,
     )
     server = LSRHTTPServer((host, port), service)

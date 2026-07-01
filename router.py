@@ -16,6 +16,7 @@ from lsr.console import LazyConsole, console, error_console
 from lsr.dataset import *
 from lsr import dependencies as _dependencies
 from lsr.dependencies import (
+    ensure_faiss,
     ensure_numpy,
     get_kmeans_class,
     get_sentence_transformer_class,
@@ -32,7 +33,7 @@ from lsr.signatures import *
 
 
 def __getattr__(name: str):
-    if name in {"np", "SentenceTransformer", "MiniBatchKMeans"}:
+    if name in {"np", "SentenceTransformer", "MiniBatchKMeans", "faiss"}:
         return getattr(_dependencies, name)
     raise AttributeError(name)
 

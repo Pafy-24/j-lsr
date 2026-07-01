@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -14,6 +15,7 @@ from .devices import print_processing_units, select_processing_unit
 from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .io_utils import load_batch_prompts, load_dataset, read_file, read_stdin_if_available, read_text_arg
+from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import FacetSignature
 from .routing import LSRRouter, json_ready_route
 from .server import serve
@@ -29,6 +31,8 @@ class RouterCLI:
             print_processing_units()
             return 0
         if self.args.command == "sign":
+            if self.args.model == "auto":
+                raise RouterError("sign does not support --model auto. Pass the model used to create embeddings.")
             if self.args.input_path:
                 self.sign_dataset()
             else:
@@ -46,6 +50,8 @@ class RouterCLI:
                 self.route_prompt()
             else:
                 self.rank_remote()
+        elif self.args.command == "benchmark-models":
+            self.benchmark_models()
         else:
             raise RouterError("Missing command. Use serve, loadsig, unloadsig, sign, or rank.")
         return 0
@@ -98,6 +104,8 @@ class RouterCLI:
         signatures = SignatureStore(self.args.signatures).load_all(required=True)
         if not signatures:
             raise RouterError(f"No facets found in signature path: {self.args.signatures}")
+        model_name = resolve_model_name(self.args.model, signatures)
+        validate_signature_model_compatibility(model_name, signatures)
         if self.args.top_k < 1:
             raise RouterError("--top-k must be at least 1.")
 
@@ -109,9 +117,17 @@ class RouterCLI:
         if not prompt:
             raise RouterError("Missing prompt. Provide -in input.txt, raw text, or stdin.")
 
-        model = load_model(self.args.model, self.args.PU, self.args.online)
+        model = load_model(model_name, self.args.PU, self.args.online)
         prompt_embedding = embed_texts(model, [prompt])[0]
-        route = LSRRouter(signatures, self.args.top_k).route(prompt, prompt_embedding)
+        route = LSRRouter(
+            signatures,
+            self.args.top_k,
+            index_policy=self.args.index,
+            model_name=model_name,
+            memory_limit_mb=self.args.memory_limit_mb,
+            descend_threshold=self.args.descend_threshold,
+            accept_threshold=self.args.accept_threshold,
+        ).route(prompt, prompt_embedding)
 
         if self.args.json:
             print(json.dumps(json_ready_route(route), ensure_ascii=False))
@@ -122,14 +138,24 @@ class RouterCLI:
         signatures = SignatureStore(self.args.signatures).load_all(required=True)
         if not signatures:
             raise RouterError(f"No facets found in signature path: {self.args.signatures}")
+        model_name = resolve_model_name(self.args.model, signatures)
+        validate_signature_model_compatibility(model_name, signatures)
         if self.args.top_k < 1:
             raise RouterError("--top-k must be at least 1.")
 
         raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
         prompts = load_batch_prompts(raw)
-        model = load_model(self.args.model, self.args.PU, self.args.online)
+        model = load_model(model_name, self.args.PU, self.args.online)
         embeddings = embed_texts(model, prompts)
-        router = LSRRouter(signatures, self.args.top_k)
+        router = LSRRouter(
+            signatures,
+            self.args.top_k,
+            index_policy=self.args.index,
+            model_name=model_name,
+            memory_limit_mb=self.args.memory_limit_mb,
+            descend_threshold=self.args.descend_threshold,
+            accept_threshold=self.args.accept_threshold,
+        )
         routes = [
             router.route(prompt, embeddings[index])
             for index, prompt in enumerate(prompts)
@@ -149,6 +175,10 @@ class RouterCLI:
             pu_index=self.args.PU,
             online=self.args.online,
             default_top_k=self.args.top_k,
+            index_policy=self.args.index,
+            memory_limit_mb=self.args.memory_limit_mb,
+            descend_threshold=self.args.descend_threshold,
+            accept_threshold=self.args.accept_threshold,
             load_initial_signatures=not self.args.no_load,
         )
 
@@ -195,6 +225,81 @@ class RouterCLI:
             print(json.dumps(response, ensure_ascii=False))
         else:
             print_route_table(response, self.args)
+
+    def benchmark_models(self) -> None:
+        raw = read_file(self.args.input_path)
+        prompts, expected = load_benchmark_items(raw)
+        models = [item.strip() for item in self.args.models.split(",") if item.strip()]
+        if not models:
+            raise RouterError("--models must include at least one model.")
+        benchmark_dataset = load_dataset(self.args.dataset)
+        default_facet = self.args.facet
+        if not default_facet and not all(str(item.get("facet") or "").strip() for item in benchmark_dataset):
+            default_facet = infer_facet_from_paths(self.args.dataset, self.args.signatures, None)
+        grouped = grouped_examples(examples_from_dataset(benchmark_dataset, default_facet))
+
+        results = []
+        for model_name in models:
+            started = time.perf_counter()
+            model = load_model(model_name, self.args.PU, self.args.online)
+            model_load_seconds = time.perf_counter() - started
+
+            build_started = time.perf_counter()
+            builder = SignatureBuilder(self.args.max_vectors)
+            signatures = {
+                facet: builder.build_from_texts(facet, texts, model)[1]
+                for facet, texts in sorted(grouped.items())
+            }
+            signature_build_seconds = time.perf_counter() - build_started
+
+            index_started = time.perf_counter()
+            router = LSRRouter(
+                signatures,
+                top_k=3,
+                index_policy=self.args.index,
+                model_name=model_name,
+                memory_limit_mb=self.args.memory_limit_mb,
+                descend_threshold=self.args.descend_threshold,
+                accept_threshold=self.args.accept_threshold,
+            )
+            index_build_seconds = time.perf_counter() - index_started
+
+            latencies_ms: list[float] = []
+            ranks: list[int | None] = []
+            for prompt, expected_facets in zip(prompts, expected):
+                route_started = time.perf_counter()
+                embedding = embed_texts(model, [prompt])[0]
+                route = router.route(prompt, embedding)
+                latencies_ms.append((time.perf_counter() - route_started) * 1000)
+                facets = [str(result["facet"]).lower() for result in route["results"]]
+                expected_set = {facet.lower() for facet in expected_facets}
+                rank = next(
+                    (index + 1 for index, facet in enumerate(facets) if facet in expected_set),
+                    None,
+                )
+                ranks.append(rank)
+
+            summary = benchmark_summary(
+                model_name,
+                model_load_seconds,
+                signature_build_seconds,
+                index_build_seconds,
+                latencies_ms,
+                ranks,
+                signatures,
+            )
+            results.append(summary)
+
+        recommendation = recommend_model(results)
+        payload = {"recommendation": recommendation, "results": results}
+        if self.args.output:
+            from pathlib import Path
+
+            Path(self.args.output).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def print_signature_summary(signatures: list[FacetSignature]) -> None:
@@ -257,6 +362,93 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
             f"[dim]Deep searched {len(route['deep_facets'])} facets: "
             f"{', '.join(route['deep_facets'])}[/dim]"
         )
+        console.print(f"[dim]Model: {route.get('modelName') or args.model}[/dim]")
+        console.print(f"[dim]Index: {route.get('indexBackend', 'unknown')}[/dim]")
+        console.print(f"[dim]Vectors scanned: {route.get('vectorsScanned', 0)}[/dim]")
+        console.print(f"[dim]Loading: {route.get('loadingPolicy', 'unknown')}[/dim]")
+
+
+def load_benchmark_items(raw: str) -> tuple[list[str], list[list[str]]]:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RouterError("Benchmark input must be a JSON list of labeled prompts.") from exc
+    if not isinstance(data, list):
+        raise RouterError("Benchmark input must be a JSON list.")
+    prompts: list[str] = []
+    expected: list[list[str]] = []
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            raise RouterError(f"Benchmark item {index} must be an object.")
+        prompt = item.get("input") or item.get("prompt") or item.get("text")
+        expected_facets = item.get("expected_facets") or item.get("expected") or item.get("facet")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RouterError(f"Benchmark item {index} has no prompt text.")
+        if isinstance(expected_facets, str):
+            expected_list = [expected_facets]
+        elif isinstance(expected_facets, list) and all(isinstance(facet, str) for facet in expected_facets):
+            expected_list = expected_facets
+        else:
+            raise RouterError(f"Benchmark item {index} has no expected facet.")
+        prompts.append(prompt.strip())
+        expected.append([facet.strip().lower() for facet in expected_list if facet.strip()])
+    return prompts, expected
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((pct / 100) * (len(ordered) - 1))))
+    return float(ordered[index])
+
+
+def estimate_signature_ram_mb(signatures: dict[str, Any]) -> float:
+    total_bytes = 0
+    for signature in signatures.values():
+        for layer in signature.layers.values():
+            total_bytes += int(layer.vectors.nbytes)
+    return total_bytes / (1024 * 1024)
+
+
+def benchmark_summary(
+    model_name: str,
+    model_load_seconds: float,
+    signature_build_seconds: float,
+    index_build_seconds: float,
+    latencies_ms: list[float],
+    ranks: list[int | None],
+    signatures: dict[str, Any],
+) -> dict[str, Any]:
+    total = len(ranks) or 1
+    recall_at_1 = sum(1 for rank in ranks if rank == 1) / total
+    recall_at_3 = sum(1 for rank in ranks if rank is not None and rank <= 3) / total
+    mrr = sum((1 / rank) for rank in ranks if rank) / total
+    return {
+        "model": model_name,
+        "recall@1": recall_at_1,
+        "recall@3": recall_at_3,
+        "mrr": mrr,
+        "latency_ms_p50": percentile(latencies_ms, 50),
+        "latency_ms_p95": percentile(latencies_ms, 95),
+        "model_load_seconds": model_load_seconds,
+        "signature_build_seconds": signature_build_seconds,
+        "index_build_seconds": index_build_seconds,
+        "signature_ram_mb": estimate_signature_ram_mb(signatures),
+    }
+
+
+def recommend_model(results: list[dict[str, Any]]) -> str:
+    if not results:
+        return ""
+    best_recall = max(float(result["recall@1"]) for result in results)
+    close = [
+        result
+        for result in results
+        if best_recall - float(result["recall@1"]) <= 0.02
+    ]
+    selected = min(close, key=lambda item: float(item["latency_ms_p50"]))
+    return str(selected["model"])
 
 
 def sign_dataset(args: argparse.Namespace) -> None:

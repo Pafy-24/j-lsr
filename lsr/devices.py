@@ -107,10 +107,18 @@ class ProcessingUnitDetector:
         self._add_windows_visible_units(units)
         return units
 
-    def select(self, index: int | None) -> ProcessingUnit | None:
+    def select(self, index: int | str | None) -> ProcessingUnit | None:
         if index is None:
             return None
         units = self.detect()
+        if isinstance(index, str):
+            if index.lower() != "auto":
+                try:
+                    index = int(index)
+                except ValueError as exc:
+                    raise RouterError("--PU must be an integer index or auto.") from exc
+            else:
+                return self.select_auto(units)
         for unit in units:
             if unit.index == index:
                 if not unit.usable:
@@ -121,6 +129,17 @@ class ProcessingUnitDetector:
                 return unit
         available = ", ".join(str(unit.index) for unit in units)
         raise RouterError(f"Invalid --PU index {index}. Available indexes: {available}")
+
+    def select_auto(self, units: list[ProcessingUnit] | None = None) -> ProcessingUnit | None:
+        active_units = units or self.detect()
+        usable = [unit for unit in active_units if unit.usable]
+        if not usable:
+            return None
+        for preferred in ("torch.cuda", "torch.mps", "torch_directml", "torch_xla"):
+            for unit in usable:
+                if unit.backend == preferred:
+                    return unit
+        return usable[0]
 
     def _add_directml_units(self, units: list[ProcessingUnit]) -> None:
         try:
@@ -209,7 +228,7 @@ def detect_processing_units() -> list[ProcessingUnit]:
     return ProcessingUnitDetector().detect()
 
 
-def select_processing_unit(index: int | None) -> ProcessingUnit | None:
+def select_processing_unit(index: int | str | None) -> ProcessingUnit | None:
     return ProcessingUnitDetector().select(index)
 
 

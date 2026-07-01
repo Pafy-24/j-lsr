@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .config import CRYPTO_QUESTION_CHARS, WEB_CONTENT_CHARS, WEB_TITLE_CHARS
 from .errors import RouterError
 from .models import RouteExample
 
@@ -109,6 +110,10 @@ class DatasetRouteExtractor:
         return examples
 
     def route_texts_from_exam_item(self, item: dict[str, Any]) -> list[str]:
+        web_texts = self.route_texts_from_web_item(item)
+        if web_texts:
+            return web_texts
+
         topic = str(item.get("topic") or "").strip()
         describe = str(item.get("describe") or "").strip()
         item_tags = tags_to_text(item.get("tags")).strip()
@@ -140,7 +145,7 @@ class DatasetRouteExtractor:
             focused = " ".join(
                 part
                 for part in [
-                    f"Question: {truncate_text(question, 900)}",
+                    f"Question: {truncate_text(question, CRYPTO_QUESTION_CHARS)}",
                     f"Topic: {truncate_text(topic, 180)}" if topic else "",
                     f"Tags: {truncate_text(tags, 240)}" if tags else "",
                     f"Keywords: {solution_terms}" if solution_terms else "",
@@ -179,6 +184,78 @@ class DatasetRouteExtractor:
                 )
 
         return route_texts
+
+    def route_texts_from_web_item(self, item: dict[str, Any]) -> list[str]:
+        url = str(item.get("url") or "").strip()
+        content = str(
+            item.get("groundtruth_content")
+            or item.get("convert_main_content")
+            or item.get("main_html")
+            or ""
+        ).strip()
+        if not url and not content:
+            return []
+
+        meta = item.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        language = str(meta.get("language") or "").strip()
+        style = str(meta.get("style") or "").strip()
+        level = str(meta.get("level") or "").strip()
+        table = tags_to_text(meta.get("table")).strip()
+        code = tags_to_text(meta.get("code")).strip()
+        equation = tags_to_text(meta.get("equation")).strip()
+
+        title = extract_markdown_title(content)
+        descriptors = " ".join(
+            part
+            for part in [
+                f"URL: {truncate_text(url, 240)}" if url else "",
+                f"Language: {language}" if language else "",
+                f"Style: {style}" if style else "",
+                f"Complexity: {level}" if level else "",
+                f"Tables: {table}" if table else "",
+                f"Code: {code}" if code else "",
+                f"Equations: {equation}" if equation else "",
+            ]
+            if part
+        )
+        body = truncate_text(content, WEB_CONTENT_CHARS)
+        route_texts = [
+            " ".join(
+                part
+                for part in [
+                    "Web page main content extraction benchmark.",
+                    descriptors,
+                    f"Title: {truncate_text(title, WEB_TITLE_CHARS)}" if title else "",
+                    f"Content: {body}" if body else "",
+                ]
+                if part
+            )
+        ]
+        if title and descriptors:
+            route_texts.append(
+                " ".join(
+                    part
+                    for part in [
+                        "Web page.",
+                        descriptors,
+                        f"Title: {truncate_text(title, WEB_TITLE_CHARS)}",
+                    ]
+                    if part
+                )
+            )
+        return route_texts
+
+
+def extract_markdown_title(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+        if stripped:
+            return stripped[:WEB_TITLE_CHARS]
+    return ""
 
 
 def route_texts_from_exam_item(item: dict[str, Any]) -> list[str]:

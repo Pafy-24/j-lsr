@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 
 from .config import (
+    DEFAULT_BENCHMARK_DATASET,
+    DEFAULT_BENCHMARK_INPUT,
+    DEFAULT_BENCHMARK_MODELS,
     DEFAULT_MAX_VECTORS,
+    DEFAULT_MEMORY_LIMIT_MB,
     DEFAULT_MODEL,
+    DEFAULT_SERVER_HOST,
+    DEFAULT_SERVER_PORT,
+    DEFAULT_SERVER_URL,
     DEFAULT_SIGNATURES,
+    DEFAULT_TOP_K,
     LAYER_ACCEPT_THRESHOLD,
     LAYER_DESCEND_THRESHOLD,
 )
@@ -41,20 +49,26 @@ def add_loading_policy_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--memory-limit-mb",
         type=float,
-        default=0.0,
-        help="Maximum signature vector memory kept warm. 0 means unlimited. Default: 0",
+        default=DEFAULT_MEMORY_LIMIT_MB,
+        help=f"Maximum signature vector memory kept warm. 0 means unlimited. Default: {DEFAULT_MEMORY_LIMIT_MB:g}",
     )
     parser.add_argument(
         "--descend-threshold",
         type=float,
-        default=LAYER_DESCEND_THRESHOLD,
-        help=f"Minimum layer score needed to continue deeper. Default: {LAYER_DESCEND_THRESHOLD}",
+        default=None,
+        help=(
+            "Override all per-layer pass thresholds from defaults.json. "
+            f"Default config fallback: {LAYER_DESCEND_THRESHOLD}"
+        ),
     )
     parser.add_argument(
         "--accept-threshold",
         type=float,
-        default=LAYER_ACCEPT_THRESHOLD,
-        help=f"Layer score that accepts a facet without deeper comparison. Default: {LAYER_ACCEPT_THRESHOLD}",
+        default=None,
+        help=(
+            "Override all per-layer accept thresholds from defaults.json. "
+            f"Default config fallback: {LAYER_ACCEPT_THRESHOLD}"
+        ),
     )
 
 
@@ -73,8 +87,8 @@ def add_signature_path_option(parser: argparse.ArgumentParser) -> None:
 def add_server_target_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--server",
-        default="http://127.0.0.1:8765",
-        help="Running LSR server URL. Default: http://127.0.0.1:8765",
+        default=DEFAULT_SERVER_URL,
+        help=f"Running LSR server URL. Default: {DEFAULT_SERVER_URL}",
     )
 
 
@@ -98,9 +112,9 @@ def parse_args() -> argparse.Namespace:
     add_runtime_options(serve)
     add_index_option(serve)
     add_loading_policy_options(serve)
-    serve.add_argument("--host", default="127.0.0.1", help="Host address. Default: 127.0.0.1")
-    serve.add_argument("--port", type=int, default=8765, help="Port. Default: 8765")
-    serve.add_argument("--top-k", type=int, default=3, help="Default result count. Default: 3")
+    serve.add_argument("--host", default=DEFAULT_SERVER_HOST, help=f"Host address. Default: {DEFAULT_SERVER_HOST}")
+    serve.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help=f"Port. Default: {DEFAULT_SERVER_PORT}")
+    serve.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help=f"Default result count. Default: {DEFAULT_TOP_K}")
     serve.add_argument(
         "--no-load",
         action="store_true",
@@ -165,7 +179,20 @@ def parse_args() -> argparse.Namespace:
     add_index_option(rank)
     add_loading_policy_options(rank)
     add_server_target_option(rank)
-    rank.add_argument("--top-k", type=int, default=3, help="Number of facets to return. Default: 3")
+    rank.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help=(
+            "Compatibility/display limit. Routing depth is controlled by per-layer "
+            f"thresholds. Default: {DEFAULT_TOP_K}"
+        ),
+    )
+    rank.add_argument(
+        "--full-depth",
+        action="store_true",
+        help="Evaluate every layer even if an earlier layer accepted the facet.",
+    )
     rank.add_argument("--batch", action="store_true", help="Rank multiple prompts.")
     rank.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     rank.add_argument(
@@ -188,13 +215,13 @@ def parse_args() -> argparse.Namespace:
         "-in",
         "--input",
         dest="input_path",
-        default="../router_test_crypto_web_100.json",
-        help="Benchmark input JSON/JSONL/text file. Default: ../router_test_crypto_web_100.json",
+        default=DEFAULT_BENCHMARK_INPUT,
+        help=f"Benchmark input JSON/JSONL/text file. Default: {DEFAULT_BENCHMARK_INPUT}",
     )
     add_signature_path_option(benchmark)
     benchmark.add_argument(
         "--models",
-        default="sentence-transformers/all-MiniLM-L6-v2,thenlper/gte-small",
+        default=DEFAULT_BENCHMARK_MODELS,
         help="Comma-separated model names to benchmark.",
     )
     benchmark.add_argument(
@@ -203,8 +230,8 @@ def parse_args() -> argparse.Namespace:
     )
     benchmark.add_argument(
         "--dataset",
-        default="../facets/Crypto/datasets/train/crypto_dataset.json",
-        help="Training dataset used to build temporary signatures per model.",
+        default=DEFAULT_BENCHMARK_DATASET,
+        help=f"Training dataset used to build temporary signatures per model. Default: {DEFAULT_BENCHMARK_DATASET}",
     )
     benchmark.add_argument("--facet", help="Facet name for benchmark dataset if it cannot be inferred.")
     benchmark.add_argument(

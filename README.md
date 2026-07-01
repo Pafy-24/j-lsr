@@ -19,6 +19,8 @@ cd E:\Licenta\Proiect\LSR
 
 - `router.py` - thin CLI compatibility entry point
 - `lsr\args.py` - CLI argument definitions
+- `lsr\defaults.json` - central defaults for models, paths, thresholds, index policy, and layer sizing
+- `lsr\config.py` - Python accessors for `defaults.json`
 - `lsr\commands.py` - command orchestration for signing and routing
 - `lsr\dataset.py` - dataset-to-route-text extraction
 - `lsr\devices.py` - processing-unit discovery and selection
@@ -27,7 +29,9 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\routing.py` - layered routing, lazy loading policy, and hierarchical search
 - `requirements.txt` - Python dependencies
 - `..\facets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
+- `..\facets\Web\datasets\train\WebMainBench_545.jsonl` - WebMainBench calibrated subset for Web routing tests
 - `..\facets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
+- `..\facets\signatures\web.sig` - ASN.1 DER hierarchical routing signature for Web
 
 There is no `signatures.json` in the active flow. A faucet signature is stored as:
 
@@ -70,6 +74,29 @@ natnitaract/exams-basic-and-quantum-cryptography-and-security-latex
 ```
 
 It contains 104 exam-level records and 347 questions. The dataset keeps training fields such as `solution`; the router ignores solution/output fields when building routing signatures.
+
+## Web Dataset
+
+The Web facet uses the calibrated `WebMainBench_545.jsonl` subset from `opendatalab/WebMainBench` on Hugging Face. WebMainBench is a benchmark for web main-content extraction, and the local copy is stored at:
+
+```text
+..\facets\Web\datasets\train\WebMainBench_545.jsonl
+```
+
+LSR extracts routing text from `url`, `groundtruth_content`, `convert_main_content`, `main_html`, and `meta` fields such as language, style, difficulty, tables, code, and equations.
+
+Generate the Web signature:
+
+```powershell
+python router.py sign `
+  -in ..\facets\Web\datasets\train\WebMainBench_545.jsonl `
+  --facet web `
+  --signatures ..\facets\signatures `
+  --max-vectors 2000 `
+  --debug
+```
+
+With both `crypto.sig` and `web.sig` present, routing can compare at least two facets locally.
 
 ## Generate Crypto Signature
 
@@ -153,34 +180,34 @@ Default runtime behavior:
 1. load metadata for all facets
 2. load and keep global L1 warm
 3. score every facet on L1
-4. descend only into selected top facets
+4. descend only facets whose current layer decision is `passed`
 5. load deeper layers on demand
 ```
 
 For memory-constrained runs, pass `--memory-limit-mb N`. In that mode, L1 is processed in chunks: load what fits, compare, unload, then continue with the next chunk. After the route finishes, loaded layers are released.
 
-Layer decisions use two thresholds:
+Layer decisions use per-layer thresholds from `lsr\defaults.json`:
 
 ```text
-score >= accept threshold  -> accept facet at this layer
-score >= descend threshold -> continue to the next layer
-score below descend        -> stop/prune
+score >= accept threshold -> accepted
+score >= pass threshold   -> passed; continue to next layer
+score < pass threshold    -> refused
 ```
 
-Defaults:
+Default config shape:
 
-```text
-descend threshold = 0.18
-accept threshold  = 0.82
+```json
+"layer_thresholds": {
+  "default": { "pass": 0.18, "accept": 0.82 },
+  "1": { "pass": 0.18, "accept": 0.82 },
+  "2": { "pass": 0.20, "accept": 0.84 },
+  "3": { "pass": 0.22, "accept": 0.86 }
+}
 ```
 
-The router still limits active facets by stage:
+Routing depth is no longer decided by top-k or a fixed number of accepted facets. `--top-k` only limits how many sorted results are returned after all threshold decisions have been evaluated.
 
-```text
-after L1 -> max 8 facets
-after L2 -> max 4 facets in diagnostics
-final    -> max 2 facets in diagnostics
-```
+For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON and table output include each layer score, threshold, and decision.
 
 Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
 
@@ -277,9 +304,9 @@ Invoke-RestMethod `
 Supported endpoints:
 
 - `GET /health` - returns model, loading policy, thresholds, signature path, loaded facets, and default `top_k`
-- `POST /rank` - accepts `{"input": "..."}`; `prompt` and `text` are also accepted
+- `POST /rank` - accepts `{"input": "..."}`; `prompt`, `text`, and `full_depth` are also accepted
 - `POST /route` - compatibility alias for `/rank`
-- `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts` and `texts` are also accepted
+- `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts`, `texts`, and `full_depth` are also accepted
 - `POST /loadsig` - accepts `{"signatures": "path/to/file-or-directory"}`
 - `POST /unloadsig` - accepts `{"facet": "crypto"}`, `{"facets": ["crypto"]}`, or `{"all": true}`
 
@@ -385,21 +412,22 @@ Global:
 --PUs                 List available processing units and exit
 
 Common runtime options:
---model NAME|auto     SentenceTransformer model name, or infer from .sig metadata
+--model NAME|auto     SentenceTransformer model name, default sentence-transformers/all-MiniLM-L6-v2,
+                      or infer from .sig metadata
 --online              Allow model downloads/checks; default is local-only
 --PU N|auto           Use processing unit index N, or auto-select a usable PU
 --index auto|flat|hnsw
                        Vector index backend; auto uses global L1 FlatIP and HNSW for large layers
 --memory-limit-mb N   0 keeps L1 warm; >0 enables chunked lazy loading under this memory budget
---descend-threshold N Minimum score needed to continue to the next layer, default 0.18
---accept-threshold N  Score that accepts a facet at the current layer, default 0.82
+--descend-threshold N Override all per-layer pass thresholds from defaults.json
+--accept-threshold N  Override all per-layer accept thresholds from defaults.json
 
 serve:
 --host HOST           Server host, default 127.0.0.1
 --port N              Server port, default 8765
 --signatures PATH     Initial .sig file or directory of .sig files
 --no-load             Start with no signatures loaded; use loadsig later
---top-k N             Default number of ranked facets, default 3
+--top-k N             Default returned result limit, default 3
 --index auto|flat|hnsw
                       Index policy, default auto
 
@@ -423,7 +451,8 @@ rank:
 -in, --input PATH     Prompt file, or batch input with --batch
 --signatures PATH     .sig file or directory for --local ranking
 --model NAME|auto     With --local, auto infers modelName from loaded signatures
---top-k N             Number of routed facets to show, default 3
+--top-k N             Returned result limit; routing depth is threshold-based
+--full-depth          Evaluate all layers even after accepted/refused layer decisions
 --batch               Rank many prompts from JSON/JSONL/stdin in one process
 --index auto|flat|hnsw
                       Index policy for --local; default auto

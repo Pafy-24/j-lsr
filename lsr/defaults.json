@@ -1,0 +1,62 @@
+{
+  "model": {
+    "default": "sentence-transformers/all-MiniLM-L6-v2",
+    "benchmark_candidates": [
+      "sentence-transformers/all-MiniLM-L6-v2",
+      "thenlper/gte-small"
+    ]
+  },
+  "paths": {
+    "signatures": "signatures",
+    "benchmark_input": "../router_test_crypto_web_100.json",
+    "benchmark_dataset": "../facets/Crypto/datasets/train/crypto_dataset.json"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "url": "http://127.0.0.1:8765"
+  },
+  "signature": {
+    "version": 3,
+    "max_vectors": 10000,
+    "top_layer_centroids": 128,
+    "layer_fanout": 10
+  },
+  "routing": {
+    "top_k": 3,
+    "search_l1_top": 3,
+    "search_next_top": 12,
+    "search_exact_max": 512,
+    "layer_thresholds": {
+      "default": {
+        "pass": 0.18,
+        "accept": 0.82
+      },
+      "1": {
+        "pass": 0.18,
+        "accept": 0.82
+      },
+      "2": {
+        "pass": 0.20,
+        "accept": 0.84
+      },
+      "3": {
+        "pass": 0.22,
+        "accept": 0.86
+      }
+    },
+    "global_l1_top": 256,
+    "memory_limit_mb": 0.0
+  },
+  "index": {
+    "hnsw_threshold": 4096,
+    "hnsw_m": 32,
+    "hnsw_ef_construction": 200,
+    "hnsw_ef_search": 64
+  },
+  "dataset": {
+    "web_content_chars": 1800,
+    "web_title_chars": 240,
+    "crypto_question_chars": 900
+  }
+}

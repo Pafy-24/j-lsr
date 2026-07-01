@@ -1,25 +1,71 @@
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_SIGNATURES = "signatures"
-DEFAULT_MAX_VECTORS = 10000
-SIGNATURE_VERSION = 3
+from __future__ import annotations
 
-TOP_LAYER_CENTROIDS = 128
-LAYER_FANOUT = 10
+import json
+from pathlib import Path
+from typing import Any
 
-SEARCH_L1_TOP = 3
-SEARCH_NEXT_TOP = 12
-SEARCH_EXACT_MAX = 512
-DEEP_FACET_MULTIPLIER = 3
-MAX_DEEP_FACETS = 8
-COARSE_DESCEND_MIN_SCORE = 0.18
-COARSE_DESCEND_MARGIN = 0.08
-LAYER_DESCEND_THRESHOLD = 0.18
-LAYER_ACCEPT_THRESHOLD = 0.82
-INDEX_HNSW_THRESHOLD = 4096
-INDEX_HNSW_M = 32
-INDEX_HNSW_EF_CONSTRUCTION = 200
-INDEX_HNSW_EF_SEARCH = 64
-GLOBAL_L1_TOP = 256
-ACTIVE_FACETS_L2 = 8
-ACTIVE_FACETS_L3 = 4
-ACTIVE_FACETS_DEEP = 2
+
+DEFAULTS_PATH = Path(__file__).with_name("defaults.json")
+
+
+def load_defaults(path: Path = DEFAULTS_PATH) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def get_config_value(config: dict[str, Any], path: str) -> Any:
+    value: Any = config
+    for key in path.split("."):
+        value = value[key]
+    return value
+
+
+CONFIG = load_defaults()
+
+DEFAULT_MODEL = str(get_config_value(CONFIG, "model.default"))
+DEFAULT_BENCHMARK_MODELS = ",".join(get_config_value(CONFIG, "model.benchmark_candidates"))
+DEFAULT_SIGNATURES = str(get_config_value(CONFIG, "paths.signatures"))
+DEFAULT_BENCHMARK_INPUT = str(get_config_value(CONFIG, "paths.benchmark_input"))
+DEFAULT_BENCHMARK_DATASET = str(get_config_value(CONFIG, "paths.benchmark_dataset"))
+DEFAULT_SERVER_HOST = str(get_config_value(CONFIG, "server.host"))
+DEFAULT_SERVER_PORT = int(get_config_value(CONFIG, "server.port"))
+DEFAULT_SERVER_URL = str(get_config_value(CONFIG, "server.url"))
+
+DEFAULT_MAX_VECTORS = int(get_config_value(CONFIG, "signature.max_vectors"))
+SIGNATURE_VERSION = int(get_config_value(CONFIG, "signature.version"))
+TOP_LAYER_CENTROIDS = int(get_config_value(CONFIG, "signature.top_layer_centroids"))
+LAYER_FANOUT = int(get_config_value(CONFIG, "signature.layer_fanout"))
+
+DEFAULT_TOP_K = int(get_config_value(CONFIG, "routing.top_k"))
+SEARCH_L1_TOP = int(get_config_value(CONFIG, "routing.search_l1_top"))
+SEARCH_NEXT_TOP = int(get_config_value(CONFIG, "routing.search_next_top"))
+SEARCH_EXACT_MAX = int(get_config_value(CONFIG, "routing.search_exact_max"))
+LAYER_THRESHOLDS = get_config_value(CONFIG, "routing.layer_thresholds")
+LAYER_DESCEND_THRESHOLD = float(LAYER_THRESHOLDS["default"]["pass"])
+LAYER_ACCEPT_THRESHOLD = float(LAYER_THRESHOLDS["default"]["accept"])
+GLOBAL_L1_TOP = int(get_config_value(CONFIG, "routing.global_l1_top"))
+DEFAULT_MEMORY_LIMIT_MB = float(get_config_value(CONFIG, "routing.memory_limit_mb"))
+
+INDEX_HNSW_THRESHOLD = int(get_config_value(CONFIG, "index.hnsw_threshold"))
+INDEX_HNSW_M = int(get_config_value(CONFIG, "index.hnsw_m"))
+INDEX_HNSW_EF_CONSTRUCTION = int(get_config_value(CONFIG, "index.hnsw_ef_construction"))
+INDEX_HNSW_EF_SEARCH = int(get_config_value(CONFIG, "index.hnsw_ef_search"))
+
+WEB_CONTENT_CHARS = int(get_config_value(CONFIG, "dataset.web_content_chars"))
+WEB_TITLE_CHARS = int(get_config_value(CONFIG, "dataset.web_title_chars"))
+CRYPTO_QUESTION_CHARS = int(get_config_value(CONFIG, "dataset.crypto_question_chars"))
+
+
+def layer_thresholds(level: int) -> dict[str, float]:
+    raw = LAYER_THRESHOLDS.get(str(level), LAYER_THRESHOLDS["default"])
+    return {
+        "pass": float(raw["pass"]),
+        "accept": float(raw["accept"]),
+    }
+
+
+def all_layer_thresholds() -> dict[str, dict[str, float]]:
+    return {
+        str(level): {"pass": float(values["pass"]), "accept": float(values["accept"])}
+        for level, values in LAYER_THRESHOLDS.items()
+    }

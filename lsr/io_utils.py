@@ -76,7 +76,7 @@ def load_dataset(path: str | Path) -> list[dict[str, Any]]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RouterError(f"Invalid JSON in {path}: {exc}") from exc
+        data = load_jsonl_dataset(raw, path, exc)
 
     if not isinstance(data, list):
         raise RouterError("Dataset must be a JSON list of objects.")
@@ -84,3 +84,21 @@ def load_dataset(path: str | Path) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise RouterError(f"Dataset item {index} must be an object.")
     return data
+
+
+def load_jsonl_dataset(raw: str, path: str | Path, original_error: json.JSONDecodeError) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for index, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RouterError(f"Invalid JSON/JSONL in {path} at line {index}: {exc}") from exc
+        if not isinstance(item, dict):
+            raise RouterError(f"JSONL dataset item {index} must be an object.")
+        items.append(item)
+    if not items:
+        raise RouterError(f"Invalid JSON in {path}: {original_error}")
+    return items

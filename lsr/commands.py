@@ -127,6 +127,7 @@ class RouterCLI:
             memory_limit_mb=self.args.memory_limit_mb,
             descend_threshold=self.args.descend_threshold,
             accept_threshold=self.args.accept_threshold,
+            full_depth=self.args.full_depth,
         ).route(prompt, prompt_embedding)
 
         if self.args.json:
@@ -155,6 +156,7 @@ class RouterCLI:
             memory_limit_mb=self.args.memory_limit_mb,
             descend_threshold=self.args.descend_threshold,
             accept_threshold=self.args.accept_threshold,
+            full_depth=self.args.full_depth,
         )
         routes = [
             router.route(prompt, embeddings[index])
@@ -207,7 +209,7 @@ class RouterCLI:
             response = post_json(
                 self.args.server,
                 "/batch",
-                {"inputs": prompts, "top_k": self.args.top_k},
+                {"inputs": prompts, "top_k": self.args.top_k, "full_depth": self.args.full_depth},
             )
         else:
             if self.args.input_path:
@@ -219,7 +221,7 @@ class RouterCLI:
             response = post_json(
                 self.args.server,
                 "/rank",
-                {"input": prompt, "top_k": self.args.top_k},
+                {"input": prompt, "top_k": self.args.top_k, "full_depth": self.args.full_depth},
             )
         if self.args.batch or self.args.json:
             print(json.dumps(response, ensure_ascii=False))
@@ -329,21 +331,17 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
     table.add_column("Rank", justify="right")
     table.add_column("Facet")
     table.add_column("Score", justify="right")
-    table.add_column("Best Vector", justify="right")
-    table.add_column("Cluster", justify="right")
+    table.add_column("Decision")
     table.add_column("Exact", justify="right")
-    table.add_column("Mode")
-    table.add_column("Best Match")
+    table.add_column("Layers")
     for rank, result in enumerate(top_results, start=1):
         table.add_row(
             str(rank),
             result["facet"],
             f"{result['score']:.4f}",
-            f"{result['best_vector_score']:.4f}",
-            f"{result['cluster_score']:.4f}",
+            str(result.get("decision", "")),
             str(result["exact_count"]),
-            str(result["mode"]),
-            f"vector #{result['vector_index']}",
+            format_layer_trace(result.get("layers", [])),
         )
     console.print(table)
 
@@ -366,6 +364,23 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
         console.print(f"[dim]Index: {route.get('indexBackend', 'unknown')}[/dim]")
         console.print(f"[dim]Vectors scanned: {route.get('vectorsScanned', 0)}[/dim]")
         console.print(f"[dim]Loading: {route.get('loadingPolicy', 'unknown')}[/dim]")
+
+
+def format_layer_trace(layers: list[dict[str, Any]]) -> str:
+    if not layers:
+        return ""
+    parts: list[str] = []
+    for layer in layers:
+        level = layer.get("level", "?")
+        score = float(layer.get("score", 0.0))
+        decision = str(layer.get("decision", ""))
+        pass_threshold = float(layer.get("passThreshold", 0.0))
+        accept_threshold = float(layer.get("acceptThreshold", 0.0))
+        parts.append(
+            f"L{level} {score:.3f} {decision} "
+            f"(p>{pass_threshold:.2f}, a>{accept_threshold:.2f})"
+        )
+    return " | ".join(parts)
 
 
 def load_benchmark_items(raw: str) -> tuple[list[str], list[list[str]]]:

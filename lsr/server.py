@@ -24,8 +24,8 @@ class LSRRouteService:
         default_top_k: int,
         index_policy: str = "auto",
         memory_limit_mb: float = 0.0,
-        descend_threshold: float = 0.18,
-        accept_threshold: float = 0.82,
+        descend_threshold: float | None = None,
+        accept_threshold: float | None = None,
         load_initial_signatures: bool = True,
     ):
         if default_top_k < 1:
@@ -67,10 +67,7 @@ class LSRRouteService:
             "index_backend": self.router.index_backend_label(),
             "loading_policy": self.router.loading_policy_label(),
             "memory_limit_mb": self.memory_limit_mb,
-            "thresholds": {
-                "descend": self.descend_threshold,
-                "accept": self.accept_threshold,
-            },
+            "thresholds": self.router.thresholds_label(),
             "signatures": self.signatures_path,
             "facets": sorted(self.signatures),
             "facet_metadata": {
@@ -126,7 +123,12 @@ class LSRRouteService:
             "facets": sorted(self.signatures),
         }
 
-    def route_one(self, prompt: str, top_k: int | None = None) -> dict[str, Any]:
+    def route_one(
+        self,
+        prompt: str,
+        top_k: int | None = None,
+        full_depth: bool = False,
+    ) -> dict[str, Any]:
         prompt = prompt.strip()
         if not prompt:
             raise RouterError("Missing prompt.")
@@ -134,10 +136,15 @@ class LSRRouteService:
             raise RouterError("No signatures loaded. Use loadsig first.")
         active_top_k = self._top_k(top_k)
         prompt_embedding = embed_texts(self.model, [prompt])[0]
-        route = self.router.route(prompt, prompt_embedding, active_top_k)
+        route = self.router.route(prompt, prompt_embedding, active_top_k, full_depth=full_depth)
         return json_ready_route(route)
 
-    def route_batch(self, prompts: list[str], top_k: int | None = None) -> list[dict[str, Any]]:
+    def route_batch(
+        self,
+        prompts: list[str],
+        top_k: int | None = None,
+        full_depth: bool = False,
+    ) -> list[dict[str, Any]]:
         cleaned = [prompt.strip() for prompt in prompts]
         if not cleaned:
             raise RouterError("Missing prompts.")
@@ -149,7 +156,9 @@ class LSRRouteService:
         active_top_k = self._top_k(top_k)
         embeddings = embed_texts(self.model, cleaned)
         return [
-            json_ready_route(self.router.route(prompt, embeddings[index], active_top_k))
+            json_ready_route(
+                self.router.route(prompt, embeddings[index], active_top_k, full_depth=full_depth)
+            )
             for index, prompt in enumerate(cleaned)
         ]
 
@@ -180,11 +189,11 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if self.path in {"/route", "/rank"}:
                 response = self.server.service.route_one(
-                    extract_prompt(payload), extract_top_k(payload)
+                    extract_prompt(payload), extract_top_k(payload), extract_full_depth(payload)
                 )
             elif self.path == "/batch":
                 response = self.server.service.route_batch(
-                    extract_prompts(payload), extract_top_k(payload)
+                    extract_prompts(payload), extract_top_k(payload), extract_full_depth(payload)
                 )
             elif self.path == "/loadsig":
                 response = self.server.service.load_signatures(extract_signature_path(payload))
@@ -262,6 +271,12 @@ def extract_top_k(payload: Any) -> int | None:
         raise RouterError("top_k must be an integer.") from exc
 
 
+def extract_full_depth(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("full_depth") or payload.get("fullDepth"))
+
+
 def extract_signature_path(payload: Any) -> str:
     if isinstance(payload, str):
         path = payload
@@ -300,8 +315,8 @@ def serve(
     default_top_k: int,
     index_policy: str = "auto",
     memory_limit_mb: float = 0.0,
-    descend_threshold: float = 0.18,
-    accept_threshold: float = 0.82,
+    descend_threshold: float | None = None,
+    accept_threshold: float | None = None,
     load_initial_signatures: bool = True,
 ) -> None:
     service = LSRRouteService(

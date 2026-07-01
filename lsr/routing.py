@@ -3,24 +3,18 @@ from __future__ import annotations
 from typing import Any
 
 from .config import (
-    ACTIVE_FACETS_DEEP,
-    ACTIVE_FACETS_L2,
-    ACTIVE_FACETS_L3,
-    COARSE_DESCEND_MARGIN,
-    COARSE_DESCEND_MIN_SCORE,
-    DEEP_FACET_MULTIPLIER,
     GLOBAL_L1_TOP,
-    LAYER_ACCEPT_THRESHOLD,
-    LAYER_DESCEND_THRESHOLD,
-    MAX_DEEP_FACETS,
     SEARCH_EXACT_MAX,
     SEARCH_L1_TOP,
     SEARCH_NEXT_TOP,
+    all_layer_thresholds,
+    layer_thresholds,
 )
 from .dependencies import ensure_numpy
 from .errors import RouterError
-from .indexes import FlatIPIndex, VectorIndex, build_index
+from .indexes import VectorIndex, build_index
 from .models import LayeredSignature
+from .routing_policy import child_ids, top_indices
 
 
 class LSRRouter:
@@ -31,12 +25,13 @@ class LSRRouter:
         index_policy: str = "auto",
         model_name: str = "",
         memory_limit_mb: float = 0.0,
-        descend_threshold: float = LAYER_DESCEND_THRESHOLD,
-        accept_threshold: float = LAYER_ACCEPT_THRESHOLD,
+        descend_threshold: float | None = None,
+        accept_threshold: float | None = None,
+        full_depth: bool = False,
     ):
         if top_k < 1:
             raise RouterError("--top-k must be at least 1.")
-        if accept_threshold < descend_threshold:
+        if accept_threshold is not None and descend_threshold is not None and accept_threshold < descend_threshold:
             raise RouterError("--accept-threshold must be greater than or equal to --descend-threshold.")
         self.signatures = signatures
         self.top_k = top_k
@@ -44,8 +39,9 @@ class LSRRouter:
         self.model_name = model_name
         self.memory_limit_mb = max(0.0, float(memory_limit_mb or 0.0))
         self.memory_limit_bytes = int(self.memory_limit_mb * 1024 * 1024)
-        self.descend_threshold = float(descend_threshold)
-        self.accept_threshold = float(accept_threshold)
+        self.descend_threshold = None if descend_threshold is None else float(descend_threshold)
+        self.accept_threshold = None if accept_threshold is None else float(accept_threshold)
+        self.full_depth = full_depth
         self.layer_indexes: dict[tuple[str, int], VectorIndex] = {}
         self.global_l1_entries: list[tuple[str, int]] = []
         self.global_l1_index: VectorIndex | None = None
@@ -53,29 +49,32 @@ class LSRRouter:
         self.last_l1_scanned = 0
         self.build_indexes()
 
-    def route(self, prompt: str, prompt_embedding: Any, top_k: int | None = None) -> dict[str, Any]:
-        active_top_k = self.top_k if top_k is None else int(top_k)
+    def route(
+        self,
+        prompt: str,
+        prompt_embedding: Any,
+        top_k: int | None = None,
+        full_depth: bool | None = None,
+    ) -> dict[str, Any]:
+        original_full_depth = self.full_depth
+        if full_depth is not None:
+            self.full_depth = bool(full_depth)
+        try:
+            return self._route(prompt, prompt_embedding, self.top_k if top_k is None else int(top_k))
+        finally:
+            self.full_depth = original_full_depth
+
+    def _route(self, prompt: str, prompt_embedding: Any, display_limit: int) -> dict[str, Any]:
         coarse_results = self.global_l1_search(prompt_embedding)
-        deep_facets = self.select_deep_facets(coarse_results, active_top_k)
-        accepted_facets = {
-            str(result["facet"])
-            for result in coarse_results
-            if float(result["score"]) >= self.accept_threshold
-        }
 
         results: list[dict[str, Any]] = []
         coarse_by_facet = {str(result["facet"]): result for result in coarse_results}
         for facet, signature in self.signatures.items():
-            if facet in accepted_facets:
-                result = dict(coarse_by_facet[facet])
-                result["mode"] = "L1 accepted"
-                result["decision"] = "accepted"
-                results.append(result)
-            elif facet in deep_facets:
+            result = dict(coarse_by_facet[facet])
+            decision = str(result.get("decision", "refused"))
+            if decision == "passed" or self.full_depth:
                 results.append(self.search_signature(signature, prompt_embedding))
             else:
-                result = dict(coarse_by_facet[facet])
-                result["decision"] = "pruned"
                 results.append(result)
 
         if not results:
@@ -90,23 +89,20 @@ class LSRRouter:
         )
         route = {
             "input": prompt,
-            "results": results[: active_top_k],
+            "results": results[:display_limit],
             "compared_facets": len(results),
-            "deep_facets": sorted(deep_facets),
+            "deep_facets": sorted(
+                str(result["facet"])
+                for result in results
+                if any(int(layer["level"]) > 1 for layer in result.get("layers", []))
+            ),
             "modelName": self.model_name,
             "indexBackend": self.index_backend_label(),
             "vectorsScanned": global_l1_scanned + deep_scanned,
-            "activeFacets": {
-                "L1": sorted(self.signatures),
-                "L2": sorted(deep_facets),
-                "L3": [str(result["facet"]) for result in results[: min(ACTIVE_FACETS_L3, len(results))]],
-                "final": [str(result["facet"]) for result in results[: min(ACTIVE_FACETS_DEEP, len(results))]],
-            },
+            "activeFacets": self.facets_by_decision(results),
             "loadingPolicy": self.loading_policy_label(),
-            "thresholds": {
-                "descend": self.descend_threshold,
-                "accept": self.accept_threshold,
-            },
+            "thresholds": self.thresholds_label(),
+            "fullDepth": self.full_depth,
         }
         if self.memory_limit_bytes:
             self.release_loaded_layers()
@@ -146,6 +142,61 @@ class LSRRouter:
             return "warm-l1"
         return f"lazy-chunked:{self.memory_limit_mb:g}MB"
 
+    def thresholds_for(self, level: int) -> dict[str, float]:
+        thresholds = layer_thresholds(level)
+        if self.descend_threshold is not None:
+            thresholds["pass"] = self.descend_threshold
+        if self.accept_threshold is not None:
+            thresholds["accept"] = self.accept_threshold
+        return thresholds
+
+    def thresholds_label(self) -> dict[str, Any]:
+        if self.descend_threshold is None and self.accept_threshold is None:
+            return all_layer_thresholds()
+        return {
+            "override": {
+                "pass": self.descend_threshold,
+                "accept": self.accept_threshold,
+            }
+        }
+
+    def layer_decision(self, level: int, score: float) -> str:
+        thresholds = self.thresholds_for(level)
+        if score >= thresholds["accept"]:
+            return "accepted"
+        if score >= thresholds["pass"]:
+            return "passed"
+        return "refused"
+
+    def layer_trace(
+        self,
+        level: int,
+        score: float,
+        vector_index: int,
+        vectors_scanned: int,
+        candidates: int,
+    ) -> dict[str, Any]:
+        thresholds = self.thresholds_for(level)
+        return {
+            "level": level,
+            "score": score,
+            "passThreshold": thresholds["pass"],
+            "acceptThreshold": thresholds["accept"],
+            "decision": self.layer_decision(level, score),
+            "vector_index": vector_index,
+            "vectors_scanned": vectors_scanned,
+            "candidates": candidates,
+        }
+
+    def facets_by_decision(self, results: list[dict[str, Any]]) -> dict[str, list[str]]:
+        grouped = {"accepted": [], "passed": [], "refused": []}
+        for result in results:
+            decision = str(result.get("decision", "refused"))
+            if decision not in grouped:
+                decision = "refused"
+            grouped[decision].append(str(result["facet"]))
+        return {key: sorted(values) for key, values in grouped.items()}
+
     def global_l1_search(self, prompt_embedding: Any) -> list[dict[str, Any]]:
         if self.global_l1_index is None:
             return self.chunked_l1_search(prompt_embedding)
@@ -160,27 +211,37 @@ class LSRRouter:
         results: list[dict[str, Any]] = []
         for facet, signature in self.signatures.items():
             facet_matches = grouped.get(facet, [])
+            first_level = signature.levels()[0]
             if facet_matches:
                 best_index, best_score = max(facet_matches, key=lambda item: item[1])
                 top_scores = [score for _, score in sorted(facet_matches, key=lambda item: item[1], reverse=True)[:5]]
                 avg_top_score = float(sum(top_scores) / len(top_scores))
             else:
-                first_level = sorted(signature.layers)[0]
-                layer = signature.layers[first_level]
+                layer = signature.get_layer(first_level)
                 index = self.layer_indexes.get((facet, first_level))
                 local_match = (index or build_index(layer.vectors, "flat", first_level)).search(prompt_embedding, 1)[0]
                 best_index, best_score = local_match.index, local_match.score
                 avg_top_score = best_score
+            score = 0.7 * best_score + 0.3 * avg_top_score
+            trace = self.layer_trace(
+                first_level,
+                score,
+                int(best_index),
+                len(self.global_l1_entries),
+                len(facet_matches) or 1,
+            )
             results.append(
                 {
                     "facet": facet,
-                    "score": 0.7 * best_score + 0.3 * avg_top_score,
+                    "score": score,
                     "best_vector_score": best_score,
                     "cluster_score": best_score,
                     "vector_index": int(best_index),
                     "exact_count": 0,
-                    "mode": "global L1 coarse",
+                    "mode": f"L{first_level} {trace['decision']}",
                     "vectors_scanned": len(self.global_l1_entries),
+                    "decision": trace["decision"],
+                    "layers": [trace],
                 }
             )
         results.sort(key=lambda item: item["score"], reverse=True)
@@ -241,19 +302,27 @@ class LSRRouter:
             best_index, best_score = max(facet_matches, key=lambda item: item[1])
             top_scores = [score for _, score in sorted(facet_matches, key=lambda item: item[1], reverse=True)[:5]]
             avg_top_score = float(sum(top_scores) / len(top_scores))
+            first_level = self.signatures[facet].levels()[0]
+            score = 0.7 * best_score + 0.3 * avg_top_score
+            trace = self.layer_trace(
+                first_level,
+                score,
+                int(best_index),
+                scanned,
+                len(facet_matches),
+            )
             results.append(
                 {
                     "facet": facet,
-                    "score": 0.7 * best_score + 0.3 * avg_top_score,
+                    "score": score,
                     "best_vector_score": best_score,
                     "cluster_score": best_score,
                     "vector_index": int(best_index),
                     "exact_count": 0,
-                    "mode": "chunked L1 coarse",
+                    "mode": f"L{first_level} {trace['decision']}",
                     "vectors_scanned": scanned,
-                    "decision": "descend"
-                    if best_score >= self.descend_threshold
-                    else "below-threshold",
+                    "decision": trace["decision"],
+                    "layers": [trace],
                 }
             )
         results.sort(key=lambda item: item["score"], reverse=True)
@@ -268,16 +337,19 @@ class LSRRouter:
         best_index = top[0]
         best_score = float(similarities[best_index])
         avg_top_score = float(np.mean(similarities[top]))
+        score = 0.7 * best_score + 0.3 * avg_top_score
+        trace = self.layer_trace(first_level, score, int(best_index), len(layer.vectors), len(layer.vectors))
         return {
             "facet": signature.facet,
-            "score": 0.7 * best_score + 0.3 * avg_top_score,
+            "score": score,
             "best_vector_score": best_score,
             "cluster_score": best_score,
             "vector_index": int(best_index),
             "exact_count": 0,
-            "mode": f"L{first_level} coarse",
+            "mode": f"L{first_level} {trace['decision']}",
             "vectors_scanned": len(layer.vectors),
-            "decision": "descend" if best_score >= self.descend_threshold else "below-threshold",
+            "decision": trace["decision"],
+            "layers": [trace],
         }
 
     def search_signature(self, signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
@@ -293,21 +365,25 @@ class LSRRouter:
             best_index = matches[0].index
             best_score = matches[0].score
             avg_top_score = float(np.mean([match.score for match in matches]))
+            score = 0.7 * best_score + 0.3 * avg_top_score
+            trace = self.layer_trace(last_level, score, int(best_index), len(last_layer.vectors), len(last_layer.vectors))
             return {
                 "facet": signature.facet,
-                "score": 0.7 * best_score + 0.3 * avg_top_score,
+                "score": score,
                 "best_vector_score": best_score,
                 "cluster_score": 0.0,
                 "vector_index": int(best_index),
                 "exact_count": len(last_layer.vectors),
-                "mode": "exact",
+                "mode": f"L{last_level} {trace['decision']}",
                 "vectors_scanned": len(last_layer.vectors),
-                "decision": "accepted",
+                "decision": trace["decision"],
+                "layers": [trace],
             }
 
         candidate_ids: list[int] | None = None
         best_cluster_score = 0.0
         vectors_scanned = 0
+        traces: list[dict[str, Any]] = []
         for position, level in enumerate(levels[:-1]):
             layer = signature.get_layer(level)
             if candidate_ids is None:
@@ -334,33 +410,45 @@ class LSRRouter:
                 if top_local:
                     best_cluster_score = float(scores[top_local[0]])
 
-            if best_cluster_score >= self.accept_threshold:
+            vector_index = int(top_source_ids[0]) if top_source_ids else 0
+            trace = self.layer_trace(
+                level,
+                best_cluster_score,
+                vector_index,
+                vectors_scanned,
+                len(source_ids),
+            )
+            traces.append(trace)
+
+            if trace["decision"] == "accepted" and not self.full_depth:
                 result = {
                     "facet": signature.facet,
                     "score": best_cluster_score,
                     "best_vector_score": best_cluster_score,
                     "cluster_score": best_cluster_score,
-                    "vector_index": int(top_source_ids[0]) if top_source_ids else 0,
+                    "vector_index": vector_index,
                     "exact_count": 0,
                     "mode": f"L{level} accepted",
                     "vectors_scanned": vectors_scanned,
                     "decision": "accepted",
+                    "layers": traces,
                 }
                 if self.memory_limit_bytes:
                     signature.release_layers_except(set())
                 return result
 
-            if best_cluster_score < self.descend_threshold:
+            if trace["decision"] == "refused" and not self.full_depth:
                 result = {
                     "facet": signature.facet,
                     "score": best_cluster_score,
                     "best_vector_score": best_cluster_score,
                     "cluster_score": best_cluster_score,
-                    "vector_index": int(top_source_ids[0]) if top_source_ids else 0,
+                    "vector_index": vector_index,
                     "exact_count": 0,
                     "mode": f"L{level} stopped",
                     "vectors_scanned": vectors_scanned,
-                    "decision": "below-threshold",
+                    "decision": "refused",
+                    "layers": traces,
                 }
                 if self.memory_limit_bytes:
                     signature.release_layers_except(set())
@@ -387,6 +475,14 @@ class LSRRouter:
         best_anchor = float(candidate_scores[best_local])
         avg_top_score = float(np.mean(candidate_scores[top_candidate_local]))
         final_score = 0.6 * best_anchor + 0.25 * avg_top_score + 0.15 * best_cluster_score
+        final_trace = self.layer_trace(
+            last_level,
+            final_score,
+            best_index,
+            len(candidates),
+            len(candidates),
+        )
+        traces.append(final_trace)
 
         return {
             "facet": signature.facet,
@@ -397,93 +493,13 @@ class LSRRouter:
             "exact_count": len(candidates),
             "mode": "deep",
             "vectors_scanned": vectors_scanned + len(candidates),
-            "decision": "accepted" if final_score >= self.accept_threshold else "ranked",
+            "decision": final_trace["decision"],
+            "layers": traces,
         }
-
-    def select_deep_facets(self, coarse_results: list[dict[str, Any]], top_k: int | None = None) -> set[str]:
-        return select_deep_facets(
-            coarse_results,
-            self.top_k if top_k is None else int(top_k),
-            self.descend_threshold,
-            self.accept_threshold,
-        )
 
     def release_loaded_layers(self) -> None:
         for signature in self.signatures.values():
             signature.release_layers_except(set())
-
-
-def child_ids(links: list[list[int]], parent_ids: list[int], max_items: int | None = None) -> list[int]:
-    ids: list[int] = []
-    seen: set[int] = set()
-    for parent_id in parent_ids:
-        if 0 <= parent_id < len(links):
-            children = links[parent_id]
-        else:
-            children = []
-        for child_id in children:
-            if child_id not in seen:
-                seen.add(child_id)
-                ids.append(child_id)
-                if max_items is not None and len(ids) >= max_items:
-                    return ids
-    return ids
-
-
-def top_indices(scores: Any, limit: int) -> list[int]:
-    np = ensure_numpy()
-    if len(scores) == 0:
-        return []
-    limit = min(max(1, limit), len(scores))
-    if limit == len(scores):
-        return np.argsort(scores)[::-1].astype(int).tolist()
-    partial = np.argpartition(scores, -limit)[-limit:]
-    ordered = partial[np.argsort(scores[partial])[::-1]]
-    return ordered.astype(int).tolist()
-
-
-def should_descend(
-    coarse_result: dict[str, Any],
-    best_coarse_score: float,
-    forced: bool,
-    descend_threshold: float = COARSE_DESCEND_MIN_SCORE,
-    accept_threshold: float = LAYER_ACCEPT_THRESHOLD,
-) -> bool:
-    score = float(coarse_result["score"])
-    if score >= accept_threshold:
-        return False
-    if forced:
-        return True
-    return (
-        score >= descend_threshold
-        and score >= best_coarse_score - COARSE_DESCEND_MARGIN
-    )
-
-
-def select_deep_facets(
-    coarse_results: list[dict[str, Any]],
-    top_k: int,
-    descend_threshold: float = COARSE_DESCEND_MIN_SCORE,
-    accept_threshold: float = LAYER_ACCEPT_THRESHOLD,
-) -> set[str]:
-    ordered = sorted(coarse_results, key=lambda item: item["score"], reverse=True)
-    if not ordered:
-        return set()
-
-    max_deep = min(MAX_DEEP_FACETS, ACTIVE_FACETS_L2, len(ordered))
-    forced_count = min(max(1, top_k), max_deep)
-    soft_limit = min(max_deep, max(forced_count, top_k * DEEP_FACET_MULTIPLIER))
-    best_score = float(ordered[0]["score"])
-
-    selected: set[str] = set()
-    for index, result in enumerate(ordered):
-        if len(selected) >= soft_limit:
-            break
-        forced = index < forced_count
-        if should_descend(result, best_score, forced, descend_threshold, accept_threshold):
-            selected.add(str(result["facet"]))
-
-    return selected
 
 
 def coarse_search_signature(signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
@@ -498,8 +514,9 @@ def search_signature(signature: LayeredSignature, prompt_embedding: Any, args: A
         getattr(args, "top_k", 3),
         getattr(args, "index", "auto"),
         memory_limit_mb=getattr(args, "memory_limit_mb", 0.0),
-        descend_threshold=getattr(args, "descend_threshold", LAYER_DESCEND_THRESHOLD),
-        accept_threshold=getattr(args, "accept_threshold", LAYER_ACCEPT_THRESHOLD),
+        descend_threshold=getattr(args, "descend_threshold", None),
+        accept_threshold=getattr(args, "accept_threshold", None),
+        full_depth=getattr(args, "full_depth", False),
     ).search_signature(
         signature, prompt_embedding
     )
@@ -516,8 +533,9 @@ def route_embedding(
         getattr(args, "top_k", 3),
         getattr(args, "index", "auto"),
         memory_limit_mb=getattr(args, "memory_limit_mb", 0.0),
-        descend_threshold=getattr(args, "descend_threshold", LAYER_DESCEND_THRESHOLD),
-        accept_threshold=getattr(args, "accept_threshold", LAYER_ACCEPT_THRESHOLD),
+        descend_threshold=getattr(args, "descend_threshold", None),
+        accept_threshold=getattr(args, "accept_threshold", None),
+        full_depth=getattr(args, "full_depth", False),
     ).route(
         prompt, prompt_embedding
     )
@@ -534,6 +552,7 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
         "activeFacets": route.get("activeFacets", {}),
         "loadingPolicy": route.get("loadingPolicy", ""),
         "thresholds": route.get("thresholds", {}),
+        "fullDepth": route.get("fullDepth", False),
         "results": [
             {
                 "rank": index,
@@ -546,6 +565,7 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
                 "vector_index": result["vector_index"],
                 "vectors_scanned": result.get("vectors_scanned", 0),
                 "decision": result.get("decision", ""),
+                "layers": result.get("layers", []),
             }
             for index, result in enumerate(route["results"], start=1)
         ],

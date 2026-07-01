@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULTS_PATH = Path(__file__).with_name("defaults.json")
+DEFAULTS_PATH = Path(__file__).with_name("../defaults.json")
 
 
 def load_defaults(path: Path = DEFAULTS_PATH) -> dict[str, Any]:

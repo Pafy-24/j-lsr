@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .config import LAYER_FANOUT, SIGNATURE_VERSION, TOP_LAYER_CENTROIDS
 from .dependencies import ensure_numpy, get_kmeans_class
@@ -55,6 +55,60 @@ def read_tlv_view(
     return tag, payload_start, payload_end, payload_end
 
 
+def read_exact(handle: BinaryIO, size: int) -> bytes:
+    payload = handle.read(size)
+    if len(payload) != size:
+        raise RouterError("Unexpected end of DER data.")
+    return payload
+
+
+def read_tlv_header(
+    handle: BinaryIO,
+    offset: int,
+    file_size: int,
+    expected_tag: int | None = None,
+) -> tuple[int, int, int, int]:
+    if offset >= file_size:
+        raise RouterError("Unexpected end of DER data.")
+    handle.seek(offset)
+    tag = read_exact(handle, 1)[0]
+    if expected_tag is not None and tag != expected_tag:
+        raise RouterError(f"Unexpected DER tag 0x{tag:02x}; expected 0x{expected_tag:02x}.")
+
+    if handle.tell() >= file_size:
+        raise RouterError("Missing DER length.")
+    first = read_exact(handle, 1)[0]
+    if first < 0x80:
+        length = first
+    else:
+        n_bytes = first & 0x7F
+        if n_bytes == 0 or handle.tell() + n_bytes > file_size:
+            raise RouterError("Invalid DER length.")
+        length = int.from_bytes(read_exact(handle, n_bytes), "big")
+
+    payload_start = handle.tell()
+    payload_end = payload_start + length
+    if payload_end > file_size:
+        raise RouterError("DER payload length exceeds file size.")
+    return tag, payload_start, payload_end, payload_end
+
+
+def read_tlv_payload(
+    handle: BinaryIO,
+    offset: int,
+    file_size: int,
+    expected_tag: int | None = None,
+) -> tuple[int, bytes, int]:
+    tag, payload_start, payload_end, next_offset = read_tlv_header(
+        handle,
+        offset,
+        file_size,
+        expected_tag,
+    )
+    handle.seek(payload_start)
+    return tag, read_exact(handle, payload_end - payload_start), next_offset
+
+
 class SignatureCodec:
     def __init__(self, model_name: str | None = None):
         self.model_name = model_name
@@ -84,90 +138,80 @@ class SignatureCodec:
     def load(self, path: Path) -> LayeredSignature:
         return self.load_lazy(path)
 
-    def load_eager(self, path: Path) -> LayeredSignature:
-        raw = path.read_bytes()
-        if not raw:
-            raise RouterError(f"Empty signature file: {path}")
-
-        if raw[:1] != b"\x30":
-            return self._load_legacy_json_signature(path, raw)
-
-        root = DerReader(raw).read_sequence()
-        version = root.read_integer()
-        if version == 2:
-            metadata = self.decode_legacy_metadata(root)
-        elif version == SIGNATURE_VERSION:
-            metadata = decode_metadata(root.read_sequence())
-        else:
-            raise RouterError(f"Unsupported signature version {version} in {path}")
-
-        dimension = int(metadata["dimension"])
-        layers_reader = root.read_sequence()
-
-        layers: dict[int, SignatureLayer] = {}
-        while layers_reader.remaining():
-            layer = self.decode_layer(layers_reader, dimension)
-            layers[layer.level] = layer
-
-        if not layers:
-            raise RouterError(f"Signature does not contain any layers: {path}")
-        return LayeredSignature(
-            facet=path.stem.lower(),
-            dimension=dimension,
-            layers=layers,
-            model_name=str(metadata["model_name"]),
-            model_hash=metadata["model_hash"],
-            normalize=bool(metadata["normalize"]),
-            distance_metric=str(metadata["distance_metric"]),
-            layer_sizes={level: len(layer.vectors) for level, layer in layers.items()},
-        )
-
     def load_lazy(self, path: Path) -> LayeredSignature:
-        raw = path.read_bytes()
-        if not raw:
+        file_size = path.stat().st_size
+        if file_size == 0:
             raise RouterError(f"Empty signature file: {path}")
 
-        if raw[:1] != b"\x30":
-            return self._load_legacy_json_signature(path, raw)
+        with path.open("rb") as handle:
+            first = read_exact(handle, 1)
+            if first != b"\x30":
+                handle.seek(0)
+                return self._load_legacy_json_signature(path, handle.read())
 
-        _, root_start, root_end, _ = read_tlv_view(raw, 0, 0x30)
-        offset = root_start
-        _, version_start, version_end, offset = read_tlv_view(raw, offset, 0x02)
-        version = int.from_bytes(raw[version_start:version_end], "big", signed=False)
-        if version != SIGNATURE_VERSION:
-            return self.load_eager(path)
+            _, root_start, root_end, _ = read_tlv_header(handle, 0, file_size, 0x30)
+            offset = root_start
+            _, version_payload, offset = read_tlv_payload(handle, offset, file_size, 0x02)
+            version = int.from_bytes(version_payload, "big", signed=False)
 
-        _, metadata_start, metadata_end, offset = read_tlv_view(raw, offset, 0x30)
-        metadata = decode_metadata(DerReader(raw[metadata_start:metadata_end]))
-        dimension = int(metadata["dimension"])
+            if version == SIGNATURE_VERSION:
+                _, metadata_payload, offset = read_tlv_payload(handle, offset, file_size, 0x30)
+                metadata = decode_metadata(DerReader(metadata_payload))
+            elif version == 2:
+                _, model_hash_value, offset = read_tlv_payload(handle, offset, file_size, 0x04)
+                _, dimension_payload, offset = read_tlv_payload(handle, offset, file_size, 0x02)
+                dimension_value = int.from_bytes(dimension_payload, "big", signed=False)
+                metadata = {
+                    "model_name": self.model_name or "",
+                    "model_hash": model_hash_value,
+                    "dimension": dimension_value,
+                    "normalize": True,
+                    "distance_metric": "cosine",
+                }
+            else:
+                raise RouterError(f"Unsupported signature version {version} in {path}")
 
-        _, layers_start, layers_end, offset = read_tlv_view(raw, offset, 0x30)
-        if offset != root_end:
-            raise RouterError("Unexpected extra fields in signature root.")
+            dimension = int(metadata["dimension"])
+            _, layers_start, layers_end, offset = read_tlv_header(handle, offset, file_size, 0x30)
+            if offset != root_end:
+                raise RouterError("Unexpected extra fields in signature root.")
 
-        refs: dict[int, SignatureLayerRef] = {}
-        layer_offset = layers_start
-        while layer_offset < layers_end:
-            layer_start = layer_offset
-            _, layer_payload_start, layer_payload_end, layer_offset = read_tlv_view(
-                raw, layer_offset, 0x30
-            )
-            _, level_start, level_end, after_level = read_tlv_view(raw, layer_payload_start, 0x02)
-            level = int.from_bytes(raw[level_start:level_end], "big", signed=False)
-            _, vectors_start, vectors_end, _ = read_tlv_view(raw, after_level, 0x04)
-            vector_bytes = vectors_end - vectors_start
-            row_size = dimension * 4
-            if row_size <= 0 or vector_bytes % row_size != 0:
-                raise RouterError(f"Invalid vector payload in signature: {path}")
-            refs[level] = SignatureLayerRef(
-                path=path,
-                start=layer_start,
-                end=layer_offset,
-                level=level,
-                vector_count=vector_bytes // row_size,
-            )
-            if layer_payload_end > layer_offset:
-                raise RouterError(f"Invalid layer bounds in signature: {path}")
+            refs: dict[int, SignatureLayerRef] = {}
+            layer_offset = layers_start
+            while layer_offset < layers_end:
+                layer_start = layer_offset
+                _, layer_payload_start, layer_payload_end, layer_offset = read_tlv_header(
+                    handle,
+                    layer_offset,
+                    file_size,
+                    0x30,
+                )
+                _, level_payload, after_level = read_tlv_payload(
+                    handle,
+                    layer_payload_start,
+                    file_size,
+                    0x02,
+                )
+                level = int.from_bytes(level_payload, "big", signed=False)
+                _, vectors_start, vectors_end, _ = read_tlv_header(
+                    handle,
+                    after_level,
+                    file_size,
+                    0x04,
+                )
+                vector_bytes = vectors_end - vectors_start
+                row_size = dimension * 4
+                if row_size <= 0 or vector_bytes % row_size != 0:
+                    raise RouterError(f"Invalid vector payload in signature: {path}")
+                refs[level] = SignatureLayerRef(
+                    path=path,
+                    start=layer_start,
+                    end=layer_offset,
+                    level=level,
+                    vector_count=vector_bytes // row_size,
+                )
+                if layer_payload_end > layer_offset:
+                    raise RouterError(f"Invalid layer bounds in signature: {path}")
 
         if not refs:
             raise RouterError(f"Signature does not contain any layers: {path}")

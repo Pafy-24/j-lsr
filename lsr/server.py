@@ -8,10 +8,11 @@ from typing import Any
 from .console import console
 from .embedding import embed_texts, load_model
 from .errors import RouterError
+from .input_digest import prepare_routing_input
 from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import LayeredSignature
+from .registry import SignatureRegistry
 from .routing import LSRRouter, json_ready_route
-from .signatures import SignatureStore
 
 
 class LSRRouteService:
@@ -37,7 +38,8 @@ class LSRRouteService:
         self.memory_limit_mb = memory_limit_mb
         self.descend_threshold = descend_threshold
         self.accept_threshold = accept_threshold
-        self.signatures: dict[str, LayeredSignature] = {}
+        self.registry = SignatureRegistry(signatures_path)
+        self.signatures: dict[str, LayeredSignature] = self.registry.signatures
         self.model_name = model_name
         if signatures_path and load_initial_signatures:
             self.load_signatures(signatures_path, required=True)
@@ -55,6 +57,7 @@ class LSRRouteService:
             memory_limit_mb=self.memory_limit_mb,
             descend_threshold=self.descend_threshold,
             accept_threshold=self.accept_threshold,
+            cache_policy="release_all" if self.memory_limit_mb else "keep_l1_only",
         )
 
     def health(self) -> dict[str, Any]:
@@ -68,6 +71,11 @@ class LSRRouteService:
             "loading_policy": self.router.loading_policy_label(),
             "memory_limit_mb": self.memory_limit_mb,
             "thresholds": self.router.thresholds_label(),
+            "cachePolicy": self.router.cache_policy_label(),
+            "loadedLayers": self.registry.loaded_layers(),
+            "loadedVectorBytes": self.registry.loaded_vector_bytes(),
+            "signatureFiles": self.registry.signature_files_payload(),
+            "staleSignatures": self.registry.stale_signatures,
             "signatures": self.signatures_path,
             "facets": sorted(self.signatures),
             "facet_metadata": {
@@ -84,10 +92,11 @@ class LSRRouteService:
         }
 
     def load_signatures(self, path: str, required: bool = True) -> dict[str, Any]:
-        loaded = SignatureStore(path).load_all(required=required)
+        self.registry = SignatureRegistry(path)
+        loaded = self.registry.load(required=required)
         if getattr(self, "model_name", "auto") != "auto":
             validate_signature_model_compatibility(self.model_name, loaded)
-        self.signatures.update(loaded)
+        self.signatures = self.registry.signatures
         self.signatures_path = path
         if hasattr(self, "router"):
             self.router = self.build_router(self.default_top_k)
@@ -102,6 +111,9 @@ class LSRRouteService:
         if unload_all:
             removed = sorted(self.signatures)
             self.signatures.clear()
+            self.registry.signatures.clear()
+            self.registry.files.clear()
+            self.registry.file_stats.clear()
             self.router = self.build_router(self.default_top_k)
             return {"unloaded": removed, "facets": []}
         if not facets:
@@ -112,7 +124,7 @@ class LSRRouteService:
         for facet in facets:
             key = facet.strip().lower()
             if key in self.signatures:
-                del self.signatures[key]
+                self.registry.unload(key)
                 removed.append(key)
             else:
                 missing.append(key)
@@ -128,15 +140,19 @@ class LSRRouteService:
         prompt: str,
         top_k: int | None = None,
         full_depth: bool = False,
+        large_input: str = "auto",
     ) -> dict[str, Any]:
         prompt = prompt.strip()
         if not prompt:
             raise RouterError("Missing prompt.")
+        self.refresh_signatures()
         if not self.signatures:
             raise RouterError("No signatures loaded. Use loadsig first.")
         active_top_k = self._top_k(top_k)
-        prompt_embedding = embed_texts(self.model, [prompt])[0]
-        route = self.router.route(prompt, prompt_embedding, active_top_k, full_depth=full_depth)
+        routing_input = prepare_routing_input(prompt, large_input)
+        prompt_embedding = embed_texts(self.model, [routing_input.routing_text])[0]
+        route = self.router.route(routing_input.routing_text, prompt_embedding, active_top_k, full_depth=full_depth)
+        attach_input_metadata(route, routing_input)
         return json_ready_route(route)
 
     def route_batch(
@@ -144,29 +160,43 @@ class LSRRouteService:
         prompts: list[str],
         top_k: int | None = None,
         full_depth: bool = False,
+        large_input: str = "auto",
     ) -> list[dict[str, Any]]:
         cleaned = [prompt.strip() for prompt in prompts]
         if not cleaned:
             raise RouterError("Missing prompts.")
+        self.refresh_signatures()
         if not self.signatures:
             raise RouterError("No signatures loaded. Use loadsig first.")
         for index, prompt in enumerate(cleaned, start=1):
             if not prompt:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
-        embeddings = embed_texts(self.model, cleaned)
-        return [
-            json_ready_route(
-                self.router.route(prompt, embeddings[index], active_top_k, full_depth=full_depth)
+        routing_inputs = [prepare_routing_input(prompt, large_input) for prompt in cleaned]
+        embeddings = embed_texts(self.model, [item.routing_text for item in routing_inputs])
+        routes = []
+        for index, routing_input in enumerate(routing_inputs):
+            route = self.router.route(
+                routing_input.routing_text,
+                embeddings[index],
+                active_top_k,
+                full_depth=full_depth,
             )
-            for index, prompt in enumerate(cleaned)
-        ]
+            attach_input_metadata(route, routing_input)
+            routes.append(json_ready_route(route))
+        return routes
 
     def _top_k(self, top_k: int | None) -> int:
         active_top_k = self.default_top_k if top_k is None else int(top_k)
         if active_top_k < 1:
             raise RouterError("top_k must be at least 1.")
         return active_top_k
+
+    def refresh_signatures(self) -> None:
+        if self.registry.refresh():
+            validate_signature_model_compatibility(self.model_name, self.registry.signatures)
+            self.signatures = self.registry.signatures
+            self.router = self.build_router(self.default_top_k)
 
 
 class LSRHTTPServer(ThreadingHTTPServer):
@@ -189,11 +219,17 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if self.path in {"/route", "/rank"}:
                 response = self.server.service.route_one(
-                    extract_prompt(payload), extract_top_k(payload), extract_full_depth(payload)
+                    extract_prompt(payload),
+                    extract_top_k(payload),
+                    extract_full_depth(payload),
+                    extract_large_input(payload),
                 )
             elif self.path == "/batch":
                 response = self.server.service.route_batch(
-                    extract_prompts(payload), extract_top_k(payload), extract_full_depth(payload)
+                    extract_prompts(payload),
+                    extract_top_k(payload),
+                    extract_full_depth(payload),
+                    extract_large_input(payload),
                 )
             elif self.path == "/loadsig":
                 response = self.server.service.load_signatures(extract_signature_path(payload))
@@ -275,6 +311,22 @@ def extract_full_depth(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     return bool(payload.get("full_depth") or payload.get("fullDepth"))
+
+
+def extract_large_input(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "auto"
+    mode = payload.get("large_input") or payload.get("largeInput") or "auto"
+    if mode not in {"auto", "off", "force"}:
+        raise RouterError("large_input must be auto, off, or force.")
+    return str(mode)
+
+
+def attach_input_metadata(route: dict[str, Any], routing_input: Any) -> None:
+    route["inputMode"] = routing_input.input_mode
+    route["inputChars"] = routing_input.input_chars
+    route["routingTextChars"] = routing_input.routing_text_chars
+    route["chunksUsed"] = routing_input.chunks_used
 
 
 def extract_signature_path(payload: Any) -> str:

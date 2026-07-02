@@ -23,8 +23,11 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\config.py` - Python accessors for `defaults.json`
 - `lsr\commands.py` - command orchestration for signing and routing
 - `lsr\dataset.py` - dataset-to-route-text extraction
+- `lsr\dataset_schema.py` - `pretrain/core/finetune` JSONL loader/adapters
 - `lsr\devices.py` - processing-unit discovery and selection
 - `lsr\embedding.py` - model loading and embedding helpers
+- `lsr\input_digest.py` - deterministic digest mode for very large inputs
+- `lsr\registry.py` - server-side signature registry and stale-file refresh
 - `lsr\signatures.py` - signature building, loading, saving, and DER codec
 - `lsr\routing.py` - layered routing, lazy loading policy, and hierarchical search
 - `requirements.txt` - Python dependencies
@@ -182,9 +185,10 @@ Default runtime behavior:
 3. score every facet on L1
 4. descend only facets whose current layer decision is `passed`
 5. load deeper layers on demand
+6. unload L2+ after the request; keep only L1 warm
 ```
 
-For memory-constrained runs, pass `--memory-limit-mb N`. In that mode, L1 is processed in chunks: load what fits, compare, unload, then continue with the next chunk. After the route finishes, loaded layers are released.
+For memory-constrained runs, pass `--memory-limit-mb N`. In that mode, L1 is processed in chunks: load what fits, compare, unload, then continue with the next chunk. After the route finishes, all loaded layers are released.
 
 Layer decisions use per-layer thresholds from `lsr\defaults.json`:
 
@@ -207,7 +211,7 @@ Default config shape:
 
 Routing depth is no longer decided by top-k or a fixed number of accepted facets. `--top-k` only limits how many sorted results are returned after all threshold decisions have been evaluated.
 
-For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON and table output include each layer score, threshold, and decision.
+For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON and table output include each layer score, threshold, decision, confidence decay, and entropy.
 
 Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
 
@@ -245,6 +249,16 @@ python router.py rank --batch --json `
 ```
 
 Batch mode sends one HTTP request to the running server, which embeds all prompts together and emits JSON. This is the preferred mode for evaluation and bulk routing.
+
+Very large inputs are routed through a deterministic digest by default when they exceed `routing.large_input.threshold_chars` in `lsr\defaults.json`. The digest uses headings, first chunks, last chunks, and keyword-heavy chunks; it does not call an LLM summarizer.
+
+```powershell
+python router.py rank -in large_document.txt --large-input auto --json
+python router.py rank -in large_document.txt --large-input force --json
+python router.py rank -in large_document.txt --large-input off --json
+```
+
+Rank JSON includes `inputMode`, `inputChars`, `routingTextChars`, and `chunksUsed`. Use `--ascii-table` if the terminal renders Unicode table borders incorrectly.
 
 By default, model loading is local-only:
 
@@ -303,12 +317,14 @@ Invoke-RestMethod `
 
 Supported endpoints:
 
-- `GET /health` - returns model, loading policy, thresholds, signature path, loaded facets, and default `top_k`
-- `POST /rank` - accepts `{"input": "..."}`; `prompt`, `text`, and `full_depth` are also accepted
+- `GET /health` - returns model, loading policy, cache policy, thresholds, signature path, loaded facets, loaded layers, loaded vector bytes, signature files, stale signatures, and default `top_k`
+- `POST /rank` - accepts `{"input": "..."}`; `prompt`, `text`, `full_depth`, and `large_input` are also accepted
 - `POST /route` - compatibility alias for `/rank`
-- `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts`, `texts`, and `full_depth` are also accepted
+- `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts`, `texts`, `full_depth`, and `large_input` are also accepted
 - `POST /loadsig` - accepts `{"signatures": "path/to/file-or-directory"}`
 - `POST /unloadsig` - accepts `{"facet": "crypto"}`, `{"facets": ["crypto"]}`, or `{"all": true}`
+
+Before each rank request, the server refreshes the signature registry. Deleted `.sig` files are unloaded, modified files are reloaded, and new `.sig` files are loaded automatically when the active signature path is a directory.
 
 Signature loading can be controlled through CLI commands while the server is running:
 
@@ -319,7 +335,7 @@ python router.py unloadsig --facet crypto --server http://127.0.0.1:8765
 python router.py unloadsig --all --server http://127.0.0.1:8765
 ```
 
-Signing remains a CLI operation. After generating or updating `.sig` files, run `loadsig` or restart `serve` if the running server should use the new signatures.
+Signing remains a CLI operation. When `serve` watches a signature directory, updated `.sig` files are picked up automatically on the next rank request.
 
 The server uses the same local-only model loading rule as CLI routing. Use `--online` only when the model is not already cached locally.
 
@@ -369,6 +385,76 @@ Rank | Facet  | Score  | Best Vector | Cluster | Exact | Mode | Best Match
 
 With only one faucet signature, every prompt returns `crypto`; the score is semantic similarity, not a calibrated probability. Add more faucet `.sig` files to compare facets directly. The `Exact` column shows how many layer-3 vectors were actually scanned after hierarchical pruning.
 
+## Dataset Format
+
+The canonical facet dataset layout is:
+
+```text
+facets
+`-- [Facet]
+    `-- datasets
+        |-- test
+        |   |-- [facet]_pretrain.jsonl
+        |   |-- [facet]_core.jsonl
+        |   `-- [facet]_finetune.jsonl
+        `-- train
+            |-- [facet]_pretrain.jsonl
+            |-- [facet]_core.jsonl
+            `-- [facet]_finetune.jsonl
+```
+
+`*_pretrain.jsonl` uses one plain text per line:
+
+```json
+{"id":"crypto_pretrain_0001","text":"AES-GCM is an authenticated encryption mode..."}
+```
+
+`*_core.jsonl` and `*_finetune.jsonl` use chat messages:
+
+```json
+{"id":"crypto_core_0001","messages":[{"role":"user","content":"Explain AES-GCM."},{"role":"assistant","content":"AES-GCM is..."}]}
+```
+
+Current normalized files:
+
+```text
+..\facets\Crypto\datasets\train\crypto_pretrain.jsonl
+..\facets\Crypto\datasets\train\crypto_core.jsonl
+..\facets\Crypto\datasets\train\crypto_finetune.jsonl
+..\facets\Crypto\datasets\test\crypto_pretrain.jsonl
+..\facets\Crypto\datasets\test\crypto_core.jsonl
+..\facets\Crypto\datasets\test\crypto_finetune.jsonl
+..\facets\Web\datasets\train\web_pretrain.jsonl
+..\facets\Web\datasets\train\web_core.jsonl
+..\facets\Web\datasets\train\web_finetune.jsonl
+..\facets\Web\datasets\test\web_pretrain.jsonl
+..\facets\Web\datasets\test\web_core.jsonl
+..\facets\Web\datasets\test\web_finetune.jsonl
+```
+
+Evaluate signatures:
+
+```powershell
+python router.py evaluate `
+  --signatures ..\facets\signatures `
+  -in ..\facets\Crypto\datasets\test\crypto_pretrain.jsonl,..\facets\Web\datasets\test\web_pretrain.jsonl `
+  --model auto `
+  --output report.json
+```
+
+Sweep threshold candidates without editing `defaults.json`:
+
+```powershell
+python router.py evaluate `
+  --signatures ..\facets\signatures `
+  -in ..\facets\Crypto\datasets\test\crypto_pretrain.jsonl,..\facets\Web\datasets\test\web_pretrain.jsonl `
+  --model auto `
+  --sweep-thresholds `
+  --output sweep-report.json
+```
+
+The report includes recall@1, recall@3, MRR, false-positive rate, refused rate, per-layer accepted/passed/refused counts, confidence-decay stats, latency p50/p95/p99, traced memory, and loaded vector bytes.
+
 ## Other Supported Dataset Shapes
 
 LSR still supports simpler JSON lists:
@@ -407,6 +493,7 @@ python router.py unloadsig [--options]
 python router.py sign [--options] [-in dataset.json | "raw text"]
 python router.py rank [--options] [-in prompt.txt | "prompt text"]
 python router.py benchmark-models [--options]
+python router.py evaluate [--options]
 
 Global:
 --PUs                 List available processing units and exit
@@ -421,6 +508,8 @@ Common runtime options:
 --memory-limit-mb N   0 keeps L1 warm; >0 enables chunked lazy loading under this memory budget
 --descend-threshold N Override all per-layer pass thresholds from defaults.json
 --accept-threshold N  Override all per-layer accept thresholds from defaults.json
+--large-input auto|off|force
+                      Large input routing mode
 
 serve:
 --host HOST           Server host, default 127.0.0.1
@@ -454,19 +543,29 @@ rank:
 --top-k N             Returned result limit; routing depth is threshold-based
 --full-depth          Evaluate all layers even after accepted/refused layer decisions
 --batch               Rank many prompts from JSON/JSONL/stdin in one process
+--large-input auto|off|force
+                      Use raw text or deterministic digest mode for large inputs
 --index auto|flat|hnsw
                       Index policy for --local; default auto
 --server URL          Server URL, default http://127.0.0.1:8765
 --local               Load model/signatures locally instead of using serve
 --remote              Compatibility option; server mode is already the default
 --json                Print machine-readable JSON output
+--ascii-table         Use ASCII-safe table borders
 --debug               Print extra details
 
 benchmark-models:
--in, --input PATH     Labeled prompt benchmark JSON, default ../router_test_crypto_web_100.json
---dataset PATH        Training dataset used to build temporary signatures per model
+-in, --input PATH     Labeled benchmark path, default test pretrain files under ../facets
+--dataset PATH        Training dataset path, directory, or comma-separated paths, default train pretrain files
 --models A,B          Candidate models, default MiniLM-L6 and gte-small
 --output PATH         Optional JSON report output
 --index auto|flat|hnsw
                       Index policy to benchmark
+
+evaluate:
+-in, --input PATH     Test dataset file, directory, or comma-separated paths, default test pretrain files
+--signatures PATH     .sig file or directory to evaluate
+--model NAME|auto     Auto infers modelName from loaded signatures
+--sweep-thresholds    Evaluate a small pass/accept threshold grid
+--output PATH         Optional JSON report output
 ```

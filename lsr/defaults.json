@@ -8,8 +8,8 @@
   },
   "paths": {
     "signatures": "signatures",
-    "benchmark_input": "../router_test_crypto_web_100.json",
-    "benchmark_dataset": "../facets/Crypto/datasets/train/crypto_dataset.json"
+    "benchmark_input": "../facets/Crypto/datasets/test/crypto_pretrain.jsonl,../facets/Web/datasets/test/web_pretrain.jsonl",
+    "benchmark_dataset": "../facets/Crypto/datasets/train/crypto_pretrain.jsonl,../facets/Web/datasets/train/web_pretrain.jsonl"
   },
   "server": {
     "host": "127.0.0.1",
@@ -46,7 +46,22 @@
       }
     },
     "global_l1_top": 256,
-    "memory_limit_mb": 0.0
+    "memory_limit_mb": 0.0,
+    "cache_policy": "keep_l1_only",
+    "confidence_decay": {
+      "enabled": false,
+      "max_delta": 0.18,
+      "penalty": 0.25
+    },
+    "large_input": {
+      "mode": "auto",
+      "threshold_chars": 20000,
+      "max_digest_chars": 12000,
+      "chunk_chars": 4000,
+      "first_chunks": 2,
+      "last_chunks": 1,
+      "keyword_chunks": 3
+    }
   },
   "index": {
     "hnsw_threshold": 4096,
@@ -55,8 +70,12 @@
     "hnsw_ef_search": 64
   },
   "dataset": {
+    "schema": "facet-training-v1",
     "web_content_chars": 1800,
     "web_title_chars": 240,
     "crypto_question_chars": 900
+  },
+  "output": {
+    "ascii_table": "auto"
   }
 }

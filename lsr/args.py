@@ -6,6 +6,7 @@ from .config import (
     DEFAULT_BENCHMARK_DATASET,
     DEFAULT_BENCHMARK_INPUT,
     DEFAULT_BENCHMARK_MODELS,
+    DEFAULT_LARGE_INPUT_MODE,
     DEFAULT_MAX_VECTORS,
     DEFAULT_MEMORY_LIMIT_MB,
     DEFAULT_MODEL,
@@ -69,6 +70,23 @@ def add_loading_policy_options(parser: argparse.ArgumentParser) -> None:
             "Override all per-layer accept thresholds from defaults.json. "
             f"Default config fallback: {LAYER_ACCEPT_THRESHOLD}"
         ),
+    )
+
+
+def add_input_policy_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--large-input",
+        choices=("auto", "off", "force"),
+        default=DEFAULT_LARGE_INPUT_MODE,
+        help=f"Large input routing mode. Default: {DEFAULT_LARGE_INPUT_MODE}",
+    )
+
+
+def add_output_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ascii-table",
+        action="store_true",
+        help="Render CLI tables with ASCII-safe characters.",
     )
 
 
@@ -178,6 +196,7 @@ def parse_args() -> argparse.Namespace:
     add_runtime_options(rank)
     add_index_option(rank)
     add_loading_policy_options(rank)
+    add_input_policy_options(rank)
     add_server_target_option(rank)
     rank.add_argument(
         "--top-k",
@@ -195,6 +214,7 @@ def parse_args() -> argparse.Namespace:
     )
     rank.add_argument("--batch", action="store_true", help="Rank multiple prompts.")
     rank.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    add_output_options(rank)
     rank.add_argument(
         "--remote",
         action="store_true",
@@ -244,5 +264,25 @@ def parse_args() -> argparse.Namespace:
     benchmark.add_argument("--PU", help="Processing unit index or auto. See --PUs.")
     add_index_option(benchmark)
     add_loading_policy_options(benchmark)
+
+    evaluate = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate loaded signatures on a labeled LSR JSONL benchmark.",
+    )
+    evaluate.add_argument(
+        "-in",
+        "--input",
+        dest="input_path",
+        default=DEFAULT_BENCHMARK_INPUT,
+        help=f"Evaluation JSON/JSONL input. Default: {DEFAULT_BENCHMARK_INPUT}",
+    )
+    add_signature_path_option(evaluate)
+    add_runtime_options(evaluate)
+    add_index_option(evaluate)
+    add_loading_policy_options(evaluate)
+    add_input_policy_options(evaluate)
+    evaluate.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help=f"Returned result limit. Default: {DEFAULT_TOP_K}")
+    evaluate.add_argument("--output", help="Optional JSON report output path.")
+    evaluate.add_argument("--sweep-thresholds", action="store_true", help="Evaluate a small pass/accept threshold grid.")
 
     return parser.parse_args()

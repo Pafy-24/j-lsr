@@ -65,3 +65,11 @@ def make_table(*args: Any, **kwargs: Any) -> Any:
     from rich.table import Table
 
     return Table(*args, **kwargs)
+
+
+def make_ascii_table(*args: Any, **kwargs: Any) -> Any:
+    from rich import box
+    from rich.table import Table
+
+    kwargs.setdefault("box", box.ASCII)
+    return Table(*args, **kwargs)

@@ -7,6 +7,10 @@ from .config import (
     SEARCH_EXACT_MAX,
     SEARCH_L1_TOP,
     SEARCH_NEXT_TOP,
+    DEFAULT_CACHE_POLICY,
+    CONFIDENCE_DECAY_ENABLED,
+    CONFIDENCE_DECAY_MAX_DELTA,
+    CONFIDENCE_DECAY_PENALTY,
     all_layer_thresholds,
     layer_thresholds,
 )
@@ -28,6 +32,7 @@ class LSRRouter:
         descend_threshold: float | None = None,
         accept_threshold: float | None = None,
         full_depth: bool = False,
+        cache_policy: str = DEFAULT_CACHE_POLICY,
     ):
         if top_k < 1:
             raise RouterError("--top-k must be at least 1.")
@@ -42,6 +47,7 @@ class LSRRouter:
         self.descend_threshold = None if descend_threshold is None else float(descend_threshold)
         self.accept_threshold = None if accept_threshold is None else float(accept_threshold)
         self.full_depth = full_depth
+        self.cache_policy = cache_policy
         self.layer_indexes: dict[tuple[str, int], VectorIndex] = {}
         self.global_l1_entries: list[tuple[str, int]] = []
         self.global_l1_index: VectorIndex | None = None
@@ -80,6 +86,8 @@ class LSRRouter:
         if not results:
             raise RouterError("No usable vectors found in signature file.")
 
+        for result in results:
+            self.apply_confidence_decay(result)
         results.sort(key=lambda item: item["score"], reverse=True)
         global_l1_scanned = self.last_l1_scanned
         deep_scanned = sum(
@@ -104,8 +112,7 @@ class LSRRouter:
             "thresholds": self.thresholds_label(),
             "fullDepth": self.full_depth,
         }
-        if self.memory_limit_bytes:
-            self.release_loaded_layers()
+        self.release_after_route()
         return route
 
     def build_indexes(self) -> None:
@@ -142,6 +149,11 @@ class LSRRouter:
             return "warm-l1"
         return f"lazy-chunked:{self.memory_limit_mb:g}MB"
 
+    def cache_policy_label(self) -> str:
+        if self.memory_limit_bytes:
+            return "release_all"
+        return self.cache_policy
+
     def thresholds_for(self, level: int) -> dict[str, float]:
         thresholds = layer_thresholds(level)
         if self.descend_threshold is not None:
@@ -177,16 +189,46 @@ class LSRRouter:
         candidates: int,
     ) -> dict[str, Any]:
         thresholds = self.thresholds_for(level)
+        delta = 0.0
+        decay = 0.0
         return {
             "level": level,
             "score": score,
             "passThreshold": thresholds["pass"],
             "acceptThreshold": thresholds["accept"],
             "decision": self.layer_decision(level, score),
+            "deltaFromPrevious": delta,
+            "confidenceDecay": decay,
+            "entropy": 0.0,
             "vector_index": vector_index,
             "vectors_scanned": vectors_scanned,
             "candidates": candidates,
         }
+
+    def enrich_trace_metrics(self, traces: list[dict[str, Any]]) -> None:
+        previous_score: float | None = None
+        for trace in traces:
+            score = float(trace["score"])
+            if previous_score is None:
+                trace["deltaFromPrevious"] = 0.0
+                trace["confidenceDecay"] = 0.0
+            else:
+                delta = score - previous_score
+                trace["deltaFromPrevious"] = delta
+                trace["confidenceDecay"] = max(0.0, -delta)
+            trace["entropy"] = confidence_entropy(score)
+            previous_score = score
+
+    def apply_confidence_decay(self, result: dict[str, Any]) -> None:
+        traces = result.get("layers", [])
+        if not traces:
+            return
+        self.enrich_trace_metrics(traces)
+        max_decay = max(float(trace.get("confidenceDecay", 0.0)) for trace in traces)
+        result["confidence_decay"] = max_decay
+        result["entropy"] = float(traces[-1].get("entropy", 0.0))
+        if CONFIDENCE_DECAY_ENABLED and max_decay > CONFIDENCE_DECAY_MAX_DELTA:
+            result["score"] = float(result["score"]) - (max_decay * CONFIDENCE_DECAY_PENALTY)
 
     def facets_by_decision(self, results: list[dict[str, Any]]) -> dict[str, list[str]]:
         grouped = {"accepted": [], "passed": [], "refused": []}
@@ -501,6 +543,16 @@ class LSRRouter:
         for signature in self.signatures.values():
             signature.release_layers_except(set())
 
+    def release_after_route(self) -> None:
+        if self.memory_limit_bytes:
+            self.release_loaded_layers()
+            return
+        if self.cache_policy == "keep_l1_only":
+            for signature in self.signatures.values():
+                levels = signature.levels()
+                keep = {levels[0]} if levels else set()
+                signature.release_layers_except(keep)
+
 
 def coarse_search_signature(signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
     return LSRRouter({signature.facet: signature}).coarse_search_signature(
@@ -541,6 +593,18 @@ def route_embedding(
     )
 
 
+def confidence_entropy(score: float) -> float:
+    probability = min(1.0, max(0.0, (float(score) + 1.0) / 2.0))
+    if probability in {0.0, 1.0}:
+        return 0.0
+    import math
+
+    return -(
+        probability * math.log2(probability)
+        + (1.0 - probability) * math.log2(1.0 - probability)
+    )
+
+
 def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
     return {
         "input": route["input"],
@@ -553,6 +617,10 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
         "loadingPolicy": route.get("loadingPolicy", ""),
         "thresholds": route.get("thresholds", {}),
         "fullDepth": route.get("fullDepth", False),
+        "inputMode": route.get("inputMode", "raw"),
+        "inputChars": route.get("inputChars", len(str(route.get("input", "")))),
+        "routingTextChars": route.get("routingTextChars", len(str(route.get("input", "")))),
+        "chunksUsed": route.get("chunksUsed", 1 if route.get("input") else 0),
         "results": [
             {
                 "rank": index,
@@ -565,6 +633,8 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
                 "vector_index": result["vector_index"],
                 "vectors_scanned": result.get("vectors_scanned", 0),
                 "decision": result.get("decision", ""),
+                "confidence_decay": result.get("confidence_decay", 0.0),
+                "entropy": result.get("entropy", 0.0),
                 "layers": result.get("layers", []),
             }
             for index, result in enumerate(route["results"], start=1)

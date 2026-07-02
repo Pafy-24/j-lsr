@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULTS_PATH = Path(__file__).with_name("../defaults.json")
+DEFAULTS_PATH = Path(__file__).with_name("defaults.json")
 
 
 def load_defaults(path: Path = DEFAULTS_PATH) -> dict[str, Any]:
@@ -45,15 +45,30 @@ LAYER_DESCEND_THRESHOLD = float(LAYER_THRESHOLDS["default"]["pass"])
 LAYER_ACCEPT_THRESHOLD = float(LAYER_THRESHOLDS["default"]["accept"])
 GLOBAL_L1_TOP = int(get_config_value(CONFIG, "routing.global_l1_top"))
 DEFAULT_MEMORY_LIMIT_MB = float(get_config_value(CONFIG, "routing.memory_limit_mb"))
+DEFAULT_CACHE_POLICY = str(get_config_value(CONFIG, "routing.cache_policy"))
+CONFIDENCE_DECAY = get_config_value(CONFIG, "routing.confidence_decay")
+CONFIDENCE_DECAY_ENABLED = bool(CONFIDENCE_DECAY["enabled"])
+CONFIDENCE_DECAY_MAX_DELTA = float(CONFIDENCE_DECAY["max_delta"])
+CONFIDENCE_DECAY_PENALTY = float(CONFIDENCE_DECAY["penalty"])
+LARGE_INPUT = get_config_value(CONFIG, "routing.large_input")
+DEFAULT_LARGE_INPUT_MODE = str(LARGE_INPUT["mode"])
+LARGE_INPUT_THRESHOLD_CHARS = int(LARGE_INPUT["threshold_chars"])
+LARGE_INPUT_MAX_DIGEST_CHARS = int(LARGE_INPUT["max_digest_chars"])
+LARGE_INPUT_CHUNK_CHARS = int(LARGE_INPUT["chunk_chars"])
+LARGE_INPUT_FIRST_CHUNKS = int(LARGE_INPUT["first_chunks"])
+LARGE_INPUT_LAST_CHUNKS = int(LARGE_INPUT["last_chunks"])
+LARGE_INPUT_KEYWORD_CHUNKS = int(LARGE_INPUT["keyword_chunks"])
 
 INDEX_HNSW_THRESHOLD = int(get_config_value(CONFIG, "index.hnsw_threshold"))
 INDEX_HNSW_M = int(get_config_value(CONFIG, "index.hnsw_m"))
 INDEX_HNSW_EF_CONSTRUCTION = int(get_config_value(CONFIG, "index.hnsw_ef_construction"))
 INDEX_HNSW_EF_SEARCH = int(get_config_value(CONFIG, "index.hnsw_ef_search"))
 
+DATASET_SCHEMA = str(get_config_value(CONFIG, "dataset.schema"))
 WEB_CONTENT_CHARS = int(get_config_value(CONFIG, "dataset.web_content_chars"))
 WEB_TITLE_CHARS = int(get_config_value(CONFIG, "dataset.web_title_chars"))
 CRYPTO_QUESTION_CHARS = int(get_config_value(CONFIG, "dataset.crypto_question_chars"))
+DEFAULT_ASCII_TABLE = str(get_config_value(CONFIG, "output.ascii_table"))
 
 
 def layer_thresholds(level: int) -> dict[str, float]:

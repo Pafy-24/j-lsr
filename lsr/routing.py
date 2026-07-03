@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from .config import (
-    GLOBAL_L1_TOP,
     SEARCH_EXACT_MAX,
     SEARCH_L1_TOP,
     SEARCH_NEXT_TOP,
@@ -11,14 +10,28 @@ from .config import (
     CONFIDENCE_DECAY_ENABLED,
     CONFIDENCE_DECAY_MAX_DELTA,
     CONFIDENCE_DECAY_PENALTY,
+    INDEX_HNSW_THRESHOLD,
+    SCORING_ANCHOR_WEIGHT,
+    SCORING_TOP_AVERAGE_WEIGHT,
+    SCORING_LAYER_WEIGHT,
+    SCORING_LEXICAL_WEIGHT,
+    SCORING_GENERIC_PENALTY,
+    SCORING_REPETITION_PENALTY,
+    SEPARATION_ENABLED,
+    SEPARATION_MIN_TOP_DELTA,
+    SEPARATION_RATIO_THRESHOLD,
+    SEPARATION_PENALTY,
+    SEPARATION_REFUSE_DELTA,
     all_layer_thresholds,
     layer_thresholds,
 )
 from .dependencies import ensure_numpy
 from .errors import RouterError
-from .indexes import VectorIndex, build_index
+from .indexes import build_index
+from .memory import current_footprint_bytes, format_bytes, release_unused_memory
 from .models import LayeredSignature
 from .routing_policy import child_ids, top_indices
+from .scoring import confidence_from_score, generic_penalty, lexical_score, repetition_penalty, weighted_layer_score
 
 
 class LSRRouter:
@@ -48,9 +61,9 @@ class LSRRouter:
         self.accept_threshold = None if accept_threshold is None else float(accept_threshold)
         self.full_depth = full_depth
         self.cache_policy = cache_policy
-        self.layer_indexes: dict[tuple[str, int], VectorIndex] = {}
+        self.layer_indexes: dict[tuple[str, int], Any] = {}
         self.global_l1_entries: list[tuple[str, int]] = []
-        self.global_l1_index: VectorIndex | None = None
+        self.global_l1_index: Any = None
         self.index_backends: set[str] = set()
         self.last_l1_scanned = 0
         self.build_indexes()
@@ -79,8 +92,14 @@ class LSRRouter:
             result = dict(coarse_by_facet[facet])
             decision = str(result.get("decision", "refused"))
             if decision == "passed" or self.full_depth:
-                results.append(self.search_signature(signature, prompt_embedding))
+                results.append(self.search_signature(signature, prompt, prompt_embedding))
             else:
+                self.apply_scoring_diagnostics(
+                    result,
+                    prompt,
+                    float(result.get("semanticScore", result.get("score", 0.0))),
+                    float(result.get("anchorSimilarity", 0.0)),
+                )
                 results.append(result)
 
         if not results:
@@ -88,6 +107,7 @@ class LSRRouter:
 
         for result in results:
             self.apply_confidence_decay(result)
+        self.apply_separation(results)
         results.sort(key=lambda item: item["score"], reverse=True)
         global_l1_scanned = self.last_l1_scanned
         deep_scanned = sum(
@@ -116,28 +136,11 @@ class LSRRouter:
         return route
 
     def build_indexes(self) -> None:
-        np = ensure_numpy()
         self.layer_indexes.clear()
         self.global_l1_entries.clear()
         self.global_l1_index = None
         self.index_backends.clear()
-        if self.memory_limit_bytes:
-            self.index_backends.add("chunked-flat")
-            return
-        l1_vectors: list[Any] = []
-        for facet, signature in sorted(self.signatures.items()):
-            levels = signature.levels()
-            if not levels:
-                continue
-            first_level = levels[0]
-            first_layer = signature.get_layer(first_level)
-            for vector_index, vector in enumerate(first_layer.vectors):
-                self.global_l1_entries.append((facet, int(vector_index)))
-                l1_vectors.append(vector)
-        if l1_vectors:
-            matrix = np.asarray(l1_vectors, dtype=np.float32)
-            self.global_l1_index = build_index(matrix, "flat", layer=1)
-            self.index_backends.add(self.global_l1_index.backend)
+        self.index_backends.add("streaming-flat")
 
     def index_backend_label(self) -> str:
         if not self.index_backends:
@@ -146,13 +149,11 @@ class LSRRouter:
 
     def loading_policy_label(self) -> str:
         if not self.memory_limit_bytes:
-            return "warm-l1"
-        return f"lazy-chunked:{self.memory_limit_mb:g}MB"
+            return "streaming-release-layer"
+        return f"streaming-release-layer:{self.memory_limit_mb:g}MB-total"
 
     def cache_policy_label(self) -> str:
-        if self.memory_limit_bytes:
-            return "release_all"
-        return self.cache_policy
+        return "release_after_layer"
 
     def thresholds_for(self, level: int) -> dict[str, float]:
         thresholds = layer_thresholds(level)
@@ -171,6 +172,34 @@ class LSRRouter:
                 "accept": self.accept_threshold,
             }
         }
+
+    def ensure_memory_available(self, extra_bytes: int, context: str) -> None:
+        if not self.memory_limit_bytes:
+            return
+        current = current_footprint_bytes()
+        required = current + max(0, int(extra_bytes))
+        if required > self.memory_limit_bytes:
+            raise RouterError(
+                f"Memory limit exceeded before loading {context}: "
+                f"current RAM/VRAM footprint {format_bytes(current)}, "
+                f"needed chunk {format_bytes(extra_bytes)}, "
+                f"limit {format_bytes(self.memory_limit_bytes)}. "
+                "Increase --memory-limit-mb or use a smaller model/dataset."
+            )
+
+    def load_layer(self, signature: LayeredSignature, level: int) -> Any:
+        if level not in signature.layers:
+            self.ensure_memory_available(
+                signature.estimated_layer_bytes(level),
+                f"{signature.facet} L{level}",
+            )
+        return signature.get_layer(level)
+
+    def release_layer(self, signature: LayeredSignature, level: int) -> None:
+        signature.release_layer(level)
+
+    def release_memory(self) -> None:
+        release_unused_memory()
 
     def layer_decision(self, level: int, score: float) -> str:
         thresholds = self.thresholds_for(level)
@@ -230,6 +259,64 @@ class LSRRouter:
         if CONFIDENCE_DECAY_ENABLED and max_decay > CONFIDENCE_DECAY_MAX_DELTA:
             result["score"] = float(result["score"]) - (max_decay * CONFIDENCE_DECAY_PENALTY)
 
+    def apply_scoring_diagnostics(
+        self,
+        result: dict[str, Any],
+        prompt: str,
+        semantic_score: float,
+        anchor_similarity: float = 0.0,
+    ) -> dict[str, Any]:
+        has_prompt = bool(prompt.strip())
+        result["semanticScore"] = float(semantic_score)
+        result["anchorSimilarity"] = float(anchor_similarity)
+        result["lexicalScore"] = lexical_score(prompt, str(result["facet"])) if has_prompt else 0.0
+        result["genericPenalty"] = generic_penalty(prompt) if has_prompt else 0.0
+        result["repetitionPenalty"] = repetition_penalty(prompt) if has_prompt else 0.0
+        last_layer = result.get("layers", [{}])[-1]
+        result["confidence"] = confidence_from_score(
+            float(result["semanticScore"]),
+            float(last_layer.get("passThreshold", 0.0)),
+            float(last_layer.get("acceptThreshold", 1.0)),
+        )
+        result["separation"] = 0.0
+        result["score"] = (
+            float(result["semanticScore"])
+            + (SCORING_LEXICAL_WEIGHT * float(result["lexicalScore"]))
+            - (SCORING_GENERIC_PENALTY * float(result["genericPenalty"]))
+            - (SCORING_REPETITION_PENALTY * float(result["repetitionPenalty"]))
+        )
+        if (
+            has_prompt
+            and
+            float(result["genericPenalty"]) >= 0.5
+            and float(result["confidence"]) < 0.12
+            and str(result.get("decision")) in {"accepted", "passed"}
+        ):
+            result["decision"] = "refused"
+            result["mode"] = f"{result.get('mode', '')} generic-refused".strip()
+        return result
+
+    def apply_separation(self, results: list[dict[str, Any]]) -> None:
+        if not results:
+            return
+        ordered = sorted(results, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        top_score = max(float(ordered[0].get("score", 0.0)), 1e-9)
+        for rank, result in enumerate(ordered):
+            score = float(result.get("score", 0.0))
+            delta = max(0.0, top_score - score)
+            ratio = score / top_score if top_score > 0 else 0.0
+            result["separation"] = delta
+            result["separationRatio"] = ratio
+            if rank == 0 or not SEPARATION_ENABLED:
+                continue
+            weak_delta = delta >= SEPARATION_REFUSE_DELTA
+            weak_ratio = ratio < SEPARATION_RATIO_THRESHOLD and delta >= SEPARATION_MIN_TOP_DELTA
+            if weak_delta or weak_ratio:
+                result["score"] = score - SEPARATION_PENALTY
+                if str(result.get("decision")) in {"accepted", "passed"}:
+                    result["decision"] = "refused"
+                    result["mode"] = f"{result.get('mode', '')} separation-refused".strip()
+
     def facets_by_decision(self, results: list[dict[str, Any]]) -> dict[str, list[str]]:
         grouped = {"accepted": [], "passed": [], "refused": []}
         for result in results:
@@ -240,318 +327,293 @@ class LSRRouter:
         return {key: sorted(values) for key, values in grouped.items()}
 
     def global_l1_search(self, prompt_embedding: Any) -> list[dict[str, Any]]:
-        if self.global_l1_index is None:
-            return self.chunked_l1_search(prompt_embedding)
-        top_k = min(len(self.global_l1_entries), max(GLOBAL_L1_TOP, len(self.global_l1_entries)))
-        matches = self.global_l1_index.search(prompt_embedding, top_k)
-        self.last_l1_scanned = len(self.global_l1_entries)
-        grouped: dict[str, list[tuple[int, float]]] = {}
-        for match in matches:
-            facet, vector_index = self.global_l1_entries[match.index]
-            grouped.setdefault(facet, []).append((vector_index, match.score))
-
-        results: list[dict[str, Any]] = []
-        for facet, signature in self.signatures.items():
-            facet_matches = grouped.get(facet, [])
-            first_level = signature.levels()[0]
-            if facet_matches:
-                best_index, best_score = max(facet_matches, key=lambda item: item[1])
-                top_scores = [score for _, score in sorted(facet_matches, key=lambda item: item[1], reverse=True)[:5]]
-                avg_top_score = float(sum(top_scores) / len(top_scores))
-            else:
-                layer = signature.get_layer(first_level)
-                index = self.layer_indexes.get((facet, first_level))
-                local_match = (index or build_index(layer.vectors, "flat", first_level)).search(prompt_embedding, 1)[0]
-                best_index, best_score = local_match.index, local_match.score
-                avg_top_score = best_score
-            score = 0.7 * best_score + 0.3 * avg_top_score
-            trace = self.layer_trace(
-                first_level,
-                score,
-                int(best_index),
-                len(self.global_l1_entries),
-                len(facet_matches) or 1,
-            )
-            results.append(
-                {
-                    "facet": facet,
-                    "score": score,
-                    "best_vector_score": best_score,
-                    "cluster_score": best_score,
-                    "vector_index": int(best_index),
-                    "exact_count": 0,
-                    "mode": f"L{first_level} {trace['decision']}",
-                    "vectors_scanned": len(self.global_l1_entries),
-                    "decision": trace["decision"],
-                    "layers": [trace],
-                }
-            )
-        results.sort(key=lambda item: item["score"], reverse=True)
-        return results
+        return self.chunked_l1_search(prompt_embedding)
 
     def chunked_l1_search(self, prompt_embedding: Any) -> list[dict[str, Any]]:
         np = ensure_numpy()
-        grouped: dict[str, list[tuple[int, float]]] = {}
-        vectors: list[Any] = []
-        entries: list[tuple[str, int]] = []
-        loaded_facets: set[str] = set()
-        bytes_used = 0
         scanned = 0
-        budget = self.memory_limit_bytes or 0
-
-        def flush() -> None:
-            nonlocal vectors, entries, loaded_facets, bytes_used, scanned
-            if not vectors:
-                return
-            matrix = np.asarray(vectors, dtype=np.float32)
-            scores = matrix @ prompt_embedding
-            for (facet, vector_index), score in zip(entries, scores.tolist()):
-                grouped.setdefault(facet, []).append((vector_index, float(score)))
-            scanned += len(entries)
-            for facet in loaded_facets:
-                signature = self.signatures.get(facet)
-                if signature is not None and signature.levels():
-                    signature.release_layer(signature.levels()[0])
-            vectors = []
-            entries = []
-            loaded_facets = set()
-            bytes_used = 0
+        results: list[dict[str, Any]] = []
 
         for facet, signature in sorted(self.signatures.items()):
             levels = signature.levels()
             if not levels:
                 continue
             first_level = levels[0]
-            layer = signature.get_layer(first_level)
-            layer_bytes = int(getattr(layer.vectors, "nbytes", 0))
-            if budget and vectors and bytes_used + layer_bytes > budget:
-                flush()
-            loaded_facets.add(facet)
-            for vector_index, vector in enumerate(layer.vectors):
-                entries.append((facet, int(vector_index)))
-                vectors.append(vector)
-            bytes_used += layer_bytes
-            if budget and bytes_used >= budget:
-                flush()
-        flush()
-        self.last_l1_scanned = scanned
+            layer = self.load_layer(signature, first_level)
+            try:
+                scanned += len(layer.vectors)
+                top, top_scores = self.search_layer(layer.vectors, prompt_embedding, min(5, len(layer.vectors)), first_level)
+                best_index = int(top[0])
+                best_score = float(top_scores[0])
+                avg_top_score = float(np.mean(top_scores))
+                score = 0.7 * best_score + 0.3 * avg_top_score
+                trace = self.layer_trace(
+                    first_level,
+                    score,
+                    best_index,
+                    len(layer.vectors),
+                    len(layer.vectors),
+                )
+                result = (
+                    {
+                        "facet": facet,
+                        "score": score,
+                        "best_vector_score": best_score,
+                        "cluster_score": best_score,
+                        "vector_index": best_index,
+                        "exact_count": 0,
+                        "mode": f"L{first_level} {trace['decision']}",
+                        "vectors_scanned": len(layer.vectors),
+                        "decision": trace["decision"],
+                        "layers": [trace],
+                    }
+                )
+                self.apply_scoring_diagnostics(result, "", score, 0.0)
+                results.append(result)
+            finally:
+                self.release_layer(signature, first_level)
+                del layer
+                self.release_memory()
 
-        results: list[dict[str, Any]] = []
-        for facet in self.signatures:
-            facet_matches = grouped.get(facet, [])
-            if not facet_matches:
-                continue
-            best_index, best_score = max(facet_matches, key=lambda item: item[1])
-            top_scores = [score for _, score in sorted(facet_matches, key=lambda item: item[1], reverse=True)[:5]]
-            avg_top_score = float(sum(top_scores) / len(top_scores))
-            first_level = self.signatures[facet].levels()[0]
-            score = 0.7 * best_score + 0.3 * avg_top_score
-            trace = self.layer_trace(
-                first_level,
-                score,
-                int(best_index),
-                scanned,
-                len(facet_matches),
-            )
-            results.append(
-                {
-                    "facet": facet,
-                    "score": score,
-                    "best_vector_score": best_score,
-                    "cluster_score": best_score,
-                    "vector_index": int(best_index),
-                    "exact_count": 0,
-                    "mode": f"L{first_level} {trace['decision']}",
-                    "vectors_scanned": scanned,
-                    "decision": trace["decision"],
-                    "layers": [trace],
-                }
-            )
+        self.last_l1_scanned = scanned
         results.sort(key=lambda item: item["score"], reverse=True)
         return results
 
     def coarse_search_signature(self, signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
         np = ensure_numpy()
         first_level = signature.levels()[0]
-        layer = signature.get_layer(first_level)
-        similarities = layer.vectors @ prompt_embedding
-        top = top_indices(similarities, min(5, len(similarities)))
-        best_index = top[0]
-        best_score = float(similarities[best_index])
-        avg_top_score = float(np.mean(similarities[top]))
-        score = 0.7 * best_score + 0.3 * avg_top_score
-        trace = self.layer_trace(first_level, score, int(best_index), len(layer.vectors), len(layer.vectors))
-        return {
-            "facet": signature.facet,
-            "score": score,
-            "best_vector_score": best_score,
-            "cluster_score": best_score,
-            "vector_index": int(best_index),
-            "exact_count": 0,
-            "mode": f"L{first_level} {trace['decision']}",
-            "vectors_scanned": len(layer.vectors),
-            "decision": trace["decision"],
-            "layers": [trace],
-        }
+        layer = self.load_layer(signature, first_level)
+        try:
+            top, top_scores = self.search_layer(layer.vectors, prompt_embedding, min(5, len(layer.vectors)), first_level)
+            best_index = top[0]
+            best_score = float(top_scores[0])
+            avg_top_score = float(np.mean(top_scores))
+            score = 0.7 * best_score + 0.3 * avg_top_score
+            trace = self.layer_trace(first_level, score, int(best_index), len(layer.vectors), len(layer.vectors))
+            result = {
+                "facet": signature.facet,
+                "score": score,
+                "best_vector_score": best_score,
+                "cluster_score": best_score,
+                "vector_index": int(best_index),
+                "exact_count": 0,
+                "mode": f"L{first_level} {trace['decision']}",
+                "vectors_scanned": len(layer.vectors),
+                "decision": trace["decision"],
+                "layers": [trace],
+            }
+            return self.apply_scoring_diagnostics(result, "", score, 0.0)
+        finally:
+            self.release_layer(signature, first_level)
+            del layer
+            self.release_memory()
 
-    def search_signature(self, signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
+    def search_signature(self, signature: LayeredSignature, prompt: str, prompt_embedding: Any) -> dict[str, Any]:
         np = ensure_numpy()
         levels = signature.levels()
         last_level = levels[-1]
 
         if len(levels) == 1:
-            last_layer = signature.get_layer(last_level)
-            index = build_index(last_layer.vectors, self.index_policy, last_level)
-            self.index_backends.add(index.backend)
-            matches = index.search(prompt_embedding, min(5, len(last_layer.vectors)))
-            best_index = matches[0].index
-            best_score = matches[0].score
-            avg_top_score = float(np.mean([match.score for match in matches]))
-            score = 0.7 * best_score + 0.3 * avg_top_score
-            trace = self.layer_trace(last_level, score, int(best_index), len(last_layer.vectors), len(last_layer.vectors))
-            return {
-                "facet": signature.facet,
-                "score": score,
-                "best_vector_score": best_score,
-                "cluster_score": 0.0,
-                "vector_index": int(best_index),
-                "exact_count": len(last_layer.vectors),
-                "mode": f"L{last_level} {trace['decision']}",
-                "vectors_scanned": len(last_layer.vectors),
-                "decision": trace["decision"],
-                "layers": [trace],
-            }
+            last_layer = self.load_layer(signature, last_level)
+            try:
+                top, top_scores = self.search_layer(last_layer.vectors, prompt_embedding, min(5, len(last_layer.vectors)), last_level)
+                best_index = int(top[0])
+                best_score = float(top_scores[0])
+                avg_top_score = float(np.mean(top_scores))
+                score = 0.7 * best_score + 0.3 * avg_top_score
+                trace = self.layer_trace(last_level, score, best_index, len(last_layer.vectors), len(last_layer.vectors))
+                result = {
+                    "facet": signature.facet,
+                    "score": score,
+                    "best_vector_score": best_score,
+                    "cluster_score": 0.0,
+                    "vector_index": best_index,
+                    "exact_count": len(last_layer.vectors),
+                    "mode": f"L{last_level} {trace['decision']}",
+                    "vectors_scanned": len(last_layer.vectors),
+                    "decision": trace["decision"],
+                    "layers": [trace],
+                }
+                return self.apply_scoring_diagnostics(result, prompt, score, best_score)
+            finally:
+                self.release_layer(signature, last_level)
+                del last_layer
+                self.release_memory()
 
         candidate_ids: list[int] | None = None
         best_cluster_score = 0.0
         vectors_scanned = 0
         traces: list[dict[str, Any]] = []
         for position, level in enumerate(levels[:-1]):
-            layer = signature.get_layer(level)
-            if candidate_ids is None:
-                local_vectors = layer.vectors
-                source_ids = list(range(len(layer.vectors)))
-                index = build_index(layer.vectors, self.index_policy, level)
-                self.index_backends.add(index.backend)
-                matches = index.search(
-                    prompt_embedding,
-                    SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP,
+            layer = self.load_layer(signature, level)
+            try:
+                if candidate_ids is None:
+                    source_ids = list(range(len(layer.vectors)))
+                    limit = SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP
+                    top_local, top_scores = self.search_layer(layer.vectors, prompt_embedding, limit, level)
+                    top_source_ids = [int(index) for index in top_local]
+                    vectors_scanned += len(layer.vectors)
+                else:
+                    source_ids = candidate_ids
+                    self.ensure_memory_available(
+                        len(candidate_ids) * signature.dimension * 4,
+                        f"{signature.facet} L{level} candidate view",
+                    )
+                    scores = layer.vectors[candidate_ids] @ prompt_embedding
+                    limit = SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP
+                    top_local = top_indices(scores, limit)
+                    top_scores = [float(scores[index]) for index in top_local]
+                    top_source_ids = [int(source_ids[index]) for index in top_local]
+                    vectors_scanned += len(candidate_ids)
+                if len(top_local):
+                    best_cluster_score = float(top_scores[0])
+
+                vector_index = int(top_source_ids[0]) if top_source_ids else 0
+                trace = self.layer_trace(
+                    level,
+                    best_cluster_score,
+                    vector_index,
+                    vectors_scanned,
+                    len(source_ids),
                 )
-                top_source_ids = [match.index for match in matches]
-                vectors_scanned += len(layer.vectors)
-                if matches:
-                    best_cluster_score = matches[0].score
-            else:
-                local_vectors = layer.vectors[candidate_ids]
-                source_ids = candidate_ids
-                scores = local_vectors @ prompt_embedding
-                limit = SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP
-                top_local = top_indices(scores, limit)
-                top_source_ids = [source_ids[index] for index in top_local]
-                vectors_scanned += len(candidate_ids)
-                if top_local:
-                    best_cluster_score = float(scores[top_local[0]])
+                traces.append(trace)
 
-            vector_index = int(top_source_ids[0]) if top_source_ids else 0
-            trace = self.layer_trace(
-                level,
-                best_cluster_score,
-                vector_index,
-                vectors_scanned,
-                len(source_ids),
-            )
-            traces.append(trace)
+                if trace["decision"] == "accepted" and not self.full_depth:
+                    result = {
+                        "facet": signature.facet,
+                        "score": best_cluster_score,
+                        "best_vector_score": best_cluster_score,
+                        "cluster_score": best_cluster_score,
+                        "vector_index": vector_index,
+                        "exact_count": 0,
+                        "mode": f"L{level} accepted",
+                        "vectors_scanned": vectors_scanned,
+                        "decision": "accepted",
+                        "layers": traces,
+                    }
+                    return self.apply_scoring_diagnostics(
+                        result,
+                        prompt,
+                        weighted_layer_score(traces),
+                        best_cluster_score,
+                    )
 
-            if trace["decision"] == "accepted" and not self.full_depth:
-                result = {
-                    "facet": signature.facet,
-                    "score": best_cluster_score,
-                    "best_vector_score": best_cluster_score,
-                    "cluster_score": best_cluster_score,
-                    "vector_index": vector_index,
-                    "exact_count": 0,
-                    "mode": f"L{level} accepted",
-                    "vectors_scanned": vectors_scanned,
-                    "decision": "accepted",
-                    "layers": traces,
-                }
-                if self.memory_limit_bytes:
-                    signature.release_layers_except(set())
-                return result
+                if trace["decision"] == "refused" and not self.full_depth:
+                    result = {
+                        "facet": signature.facet,
+                        "score": best_cluster_score,
+                        "best_vector_score": best_cluster_score,
+                        "cluster_score": best_cluster_score,
+                        "vector_index": vector_index,
+                        "exact_count": 0,
+                        "mode": f"L{level} stopped",
+                        "vectors_scanned": vectors_scanned,
+                        "decision": "refused",
+                        "layers": traces,
+                    }
+                    return self.apply_scoring_diagnostics(
+                        result,
+                        prompt,
+                        weighted_layer_score(traces),
+                        best_cluster_score,
+                    )
 
-            if trace["decision"] == "refused" and not self.full_depth:
-                result = {
-                    "facet": signature.facet,
-                    "score": best_cluster_score,
-                    "best_vector_score": best_cluster_score,
-                    "cluster_score": best_cluster_score,
-                    "vector_index": vector_index,
-                    "exact_count": 0,
-                    "mode": f"L{level} stopped",
-                    "vectors_scanned": vectors_scanned,
-                    "decision": "refused",
-                    "layers": traces,
-                }
-                if self.memory_limit_bytes:
-                    signature.release_layers_except(set())
-                return result
+                next_limit = SEARCH_EXACT_MAX if levels[position + 1] == last_level else None
+                candidate_ids = child_ids(layer.links, top_source_ids, next_limit)
+            finally:
+                self.release_layer(signature, level)
+                del layer
+                self.release_memory()
 
-            next_limit = SEARCH_EXACT_MAX if levels[position + 1] == last_level else None
-            candidate_ids = child_ids(layer.links, top_source_ids, next_limit)
             if not candidate_ids:
-                next_layer = signature.get_layer(levels[position + 1])
-                fallback_limit = next_limit or len(next_layer.vectors)
-                candidate_ids = list(range(min(len(next_layer.vectors), fallback_limit)))
-                if self.memory_limit_bytes:
-                    signature.release_layer(levels[position + 1])
-            if self.memory_limit_bytes:
-                signature.release_layer(level)
+                next_level = levels[position + 1]
+                next_layer = self.load_layer(signature, next_level)
+                try:
+                    fallback_limit = next_limit or len(next_layer.vectors)
+                    candidate_ids = list(range(min(len(next_layer.vectors), fallback_limit)))
+                finally:
+                    self.release_layer(signature, next_level)
+                    del next_layer
+                    self.release_memory()
 
-        last_layer = signature.get_layer(last_level)
-        candidates = candidate_ids or list(range(min(len(last_layer.vectors), SEARCH_EXACT_MAX)))
-        candidate_matrix = last_layer.vectors[candidates]
-        candidate_scores = candidate_matrix @ prompt_embedding
-        top_candidate_local = top_indices(candidate_scores, min(5, len(candidate_scores)))
-        best_local = top_candidate_local[0]
-        best_index = int(candidates[best_local])
-        best_anchor = float(candidate_scores[best_local])
-        avg_top_score = float(np.mean(candidate_scores[top_candidate_local]))
-        final_score = 0.6 * best_anchor + 0.25 * avg_top_score + 0.15 * best_cluster_score
-        final_trace = self.layer_trace(
-            last_level,
-            final_score,
-            best_index,
-            len(candidates),
-            len(candidates),
-        )
-        traces.append(final_trace)
+        last_layer = self.load_layer(signature, last_level)
+        try:
+            candidates = candidate_ids or list(range(min(len(last_layer.vectors), SEARCH_EXACT_MAX)))
+            self.ensure_memory_available(
+                len(candidates) * signature.dimension * 4,
+                f"{signature.facet} L{last_level} exact candidate view",
+            )
+            candidate_scores = last_layer.vectors[candidates] @ prompt_embedding
+            top_candidate_local = top_indices(candidate_scores, min(5, len(candidate_scores)))
+            best_local = top_candidate_local[0]
+            best_index = int(candidates[best_local])
+            best_anchor = float(candidate_scores[best_local])
+            avg_top_score = float(np.mean(candidate_scores[top_candidate_local]))
+            layer_score = weighted_layer_score(traces)
+            final_score = (
+                (SCORING_ANCHOR_WEIGHT * best_anchor)
+                + (SCORING_TOP_AVERAGE_WEIGHT * avg_top_score)
+                + (SCORING_LAYER_WEIGHT * layer_score)
+            )
+            final_trace = self.layer_trace(
+                last_level,
+                final_score,
+                best_index,
+                len(candidates),
+                len(candidates),
+            )
+            traces.append(final_trace)
 
-        return {
-            "facet": signature.facet,
-            "score": final_score,
-            "best_vector_score": best_anchor,
-            "cluster_score": best_cluster_score,
-            "vector_index": best_index,
-            "exact_count": len(candidates),
-            "mode": "deep",
-            "vectors_scanned": vectors_scanned + len(candidates),
-            "decision": final_trace["decision"],
-            "layers": traces,
-        }
+            result = {
+                "facet": signature.facet,
+                "score": final_score,
+                "best_vector_score": best_anchor,
+                "cluster_score": best_cluster_score,
+                "vector_index": best_index,
+                "exact_count": len(candidates),
+                "mode": "deep",
+                "vectors_scanned": vectors_scanned + len(candidates),
+                "decision": final_trace["decision"],
+                "layers": traces,
+            }
+            return self.apply_scoring_diagnostics(result, prompt, final_score, best_anchor)
+        finally:
+            self.release_layer(signature, last_level)
+            del last_layer
+            self.release_memory()
 
     def release_loaded_layers(self) -> None:
         for signature in self.signatures.values():
             signature.release_layers_except(set())
 
     def release_after_route(self) -> None:
-        if self.memory_limit_bytes:
-            self.release_loaded_layers()
-            return
-        if self.cache_policy == "keep_l1_only":
-            for signature in self.signatures.values():
-                levels = signature.levels()
-                keep = {levels[0]} if levels else set()
-                signature.release_layers_except(keep)
+        self.release_loaded_layers()
+        self.release_memory()
+
+    def search_layer(self, vectors: Any, query: Any, limit: int, level: int) -> tuple[list[int], list[float]]:
+        np = ensure_numpy()
+        if len(vectors) == 0:
+            return [], []
+        active_limit = min(max(1, int(limit)), len(vectors))
+        use_index = (
+            self.index_policy in {"auto", "hnsw", "flat"}
+            and not self.memory_limit_bytes
+            and (self.index_policy == "hnsw" or len(vectors) > INDEX_HNSW_THRESHOLD)
+        )
+        if use_index:
+            index = build_index(vectors, self.index_policy, level)
+            self.index_backends.add(index.backend)
+            try:
+                matches = index.search(query, active_limit)
+                return [match.index for match in matches], [match.score for match in matches]
+            finally:
+                del index
+                self.release_memory()
+
+        scores = vectors @ query
+        top = top_indices(scores, active_limit)
+        self.index_backends.add("flat")
+        return [int(index) for index in top], [float(scores[index]) for index in top]
 
 
 def coarse_search_signature(signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
@@ -570,7 +632,7 @@ def search_signature(signature: LayeredSignature, prompt_embedding: Any, args: A
         accept_threshold=getattr(args, "accept_threshold", None),
         full_depth=getattr(args, "full_depth", False),
     ).search_signature(
-        signature, prompt_embedding
+        signature, "", prompt_embedding
     )
 
 
@@ -633,6 +695,14 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
                 "vector_index": result["vector_index"],
                 "vectors_scanned": result.get("vectors_scanned", 0),
                 "decision": result.get("decision", ""),
+                "semanticScore": result.get("semanticScore", result["score"]),
+                "confidence": result.get("confidence", 0.0),
+                "separation": result.get("separation", 0.0),
+                "separationRatio": result.get("separationRatio", 0.0),
+                "anchorSimilarity": result.get("anchorSimilarity", 0.0),
+                "lexicalScore": result.get("lexicalScore", 0.0),
+                "genericPenalty": result.get("genericPenalty", 0.0),
+                "repetitionPenalty": result.get("repetitionPenalty", 0.0),
                 "confidence_decay": result.get("confidence_decay", 0.0),
                 "entropy": result.get("entropy", 0.0),
                 "layers": result.get("layers", []),

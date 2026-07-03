@@ -51,7 +51,10 @@ def add_loading_policy_options(parser: argparse.ArgumentParser) -> None:
         "--memory-limit-mb",
         type=float,
         default=DEFAULT_MEMORY_LIMIT_MB,
-        help=f"Maximum signature vector memory kept warm. 0 means unlimited. Default: {DEFAULT_MEMORY_LIMIT_MB:g}",
+        help=(
+            "Maximum total RAM/VRAM footprint allowed before loading a routing layer. "
+            f"0 means unlimited. Default: {DEFAULT_MEMORY_LIMIT_MB:g}"
+        ),
     )
     parser.add_argument(
         "--descend-threshold",

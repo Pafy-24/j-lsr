@@ -53,6 +53,21 @@
       "max_delta": 0.18,
       "penalty": 0.25
     },
+    "scoring": {
+      "anchor_weight": 0.55,
+      "top_average_weight": 0.25,
+      "layer_weight": 0.20,
+      "lexical_weight": 0.05,
+      "generic_penalty": 0.05,
+      "repetition_penalty": 0.08,
+      "separation": {
+        "enabled": true,
+        "min_top_delta": 0.08,
+        "ratio_threshold": 0.72,
+        "penalty": 0.12,
+        "refuse_delta": 0.22
+      }
+    },
     "large_input": {
       "mode": "auto",
       "threshold_chars": 20000,

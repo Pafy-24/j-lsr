@@ -15,8 +15,9 @@ from .dependencies import make_ascii_table, make_table
 from .devices import print_processing_units, select_processing_unit
 from .embedding import embed_texts, load_model
 from .errors import RouterError
-from .input_digest import prepare_routing_input
+from .input_digest import prepare_routing_input, prepare_routing_input_from_path
 from .io_utils import load_batch_prompts, read_file, read_stdin_if_available, read_text_arg
+from .memory import current_footprint_bytes
 from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import FacetSignature
 from .routing import LSRRouter, json_ready_route
@@ -106,8 +107,10 @@ class RouterCLI:
         if self.args.top_k < 1:
             raise RouterError("--top-k must be at least 1.")
 
+        routing_input = None
         if self.args.input_path:
-            prompt = read_file(self.args.input_path)
+            routing_input = prepare_routing_input_from_path(self.args.input_path, self.args.large_input)
+            prompt = routing_input.routing_text
         else:
             prompt = read_text_arg(self.args.text) or read_stdin_if_available()
 
@@ -115,7 +118,8 @@ class RouterCLI:
             raise RouterError("Missing prompt. Provide -in input.txt, raw text, or stdin.")
 
         model = load_model(model_name, self.args.PU, self.args.online)
-        routing_input = prepare_routing_input(prompt, self.args.large_input)
+        if routing_input is None:
+            routing_input = prepare_routing_input(prompt, self.args.large_input)
         prompt_embedding = embed_texts(model, [routing_input.routing_text])[0]
         route = LSRRouter(
             signatures,
@@ -220,8 +224,10 @@ class RouterCLI:
                 },
             )
         else:
+            routing_input = None
             if self.args.input_path:
-                prompt = read_file(self.args.input_path)
+                routing_input = prepare_routing_input_from_path(self.args.input_path, self.args.large_input)
+                prompt = routing_input.routing_text
             else:
                 prompt = read_text_arg(self.args.text) or read_stdin_if_available()
             if not prompt:
@@ -233,9 +239,14 @@ class RouterCLI:
                     "input": prompt,
                     "top_k": self.args.top_k,
                     "full_depth": self.args.full_depth,
-                    "large_input": self.args.large_input,
+                    "large_input": "off" if routing_input is not None else self.args.large_input,
                 },
             )
+            if routing_input is not None:
+                response["inputMode"] = routing_input.input_mode
+                response["inputChars"] = routing_input.input_chars
+                response["routingTextChars"] = routing_input.routing_text_chars
+                response["chunksUsed"] = routing_input.chunks_used
         if self.args.batch or self.args.json:
             print(json.dumps(response, ensure_ascii=False))
         else:
@@ -377,6 +388,12 @@ class RouterCLI:
         decisions_by_layer: dict[str, dict[str, int]] = {}
         decays: list[float] = []
         entropies: list[float] = []
+        confidences: list[float] = []
+        separations: list[float] = []
+        separation_ratios: list[float] = []
+        lexical_scores: list[float] = []
+        generic_penalties: list[float] = []
+        repetition_penalties: list[float] = []
         before_memory = process_memory_mb()
 
         for prompt, expected_facets in zip(prompts, expected):
@@ -397,6 +414,12 @@ class RouterCLI:
             for result in results:
                 decays.append(float(result.get("confidence_decay", 0.0)))
                 entropies.append(float(result.get("entropy", 0.0)))
+                confidences.append(float(result.get("confidence", 0.0)))
+                separations.append(float(result.get("separation", 0.0)))
+                separation_ratios.append(float(result.get("separationRatio", 0.0)))
+                lexical_scores.append(float(result.get("lexicalScore", 0.0)))
+                generic_penalties.append(float(result.get("genericPenalty", 0.0)))
+                repetition_penalties.append(float(result.get("repetitionPenalty", 0.0)))
                 for layer in result.get("layers", []):
                     key = str(layer.get("level"))
                     decision = str(layer.get("decision"))
@@ -415,6 +438,12 @@ class RouterCLI:
             "refusedRate": refused / total,
             "decisionsByLayer": decisions_by_layer,
             "confidenceDecay": metric_summary(decays),
+            "confidence": metric_summary(confidences),
+            "separation": metric_summary(separations),
+            "separationRatio": metric_summary(separation_ratios),
+            "lexicalScore": metric_summary(lexical_scores),
+            "genericPenalty": metric_summary(generic_penalties),
+            "repetitionPenalty": metric_summary(repetition_penalties),
             "entropy": metric_summary(entropies),
             "latencyMs": {
                 "p50": percentile(latencies_ms, 50),
@@ -595,15 +624,7 @@ def threshold_grid() -> list[tuple[float, float]]:
 
 
 def process_memory_mb() -> float:
-    try:
-        import tracemalloc
-
-        if not tracemalloc.is_tracing():
-            tracemalloc.start()
-        current, _peak = tracemalloc.get_traced_memory()
-        return current / (1024 * 1024)
-    except Exception:
-        return 0.0
+    return current_footprint_bytes() / (1024 * 1024)
 
 
 def estimate_signature_ram_mb(signatures: dict[str, Any]) -> float:

@@ -34,6 +34,7 @@ class LayeredSignature:
     normalize: bool = True
     distance_metric: str = "cosine"
     layer_sizes: dict[int, int] = field(default_factory=dict)
+    layer_byte_sizes: dict[int, int] = field(default_factory=dict)
     layer_loader: Any = None
 
     def levels(self) -> list[int]:
@@ -63,6 +64,12 @@ class LayeredSignature:
         for layer in self.layers.values():
             total += int(getattr(layer.vectors, "nbytes", 0))
         return total
+
+    def estimated_layer_bytes(self, level: int) -> int:
+        if level in self.layer_byte_sizes:
+            return int(self.layer_byte_sizes[level])
+        vector_count = int(self.layer_sizes.get(level, 0))
+        return vector_count * int(self.dimension) * 4
 
 
 @dataclass

@@ -27,7 +27,9 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\devices.py` - processing-unit discovery and selection
 - `lsr\embedding.py` - model loading and embedding helpers
 - `lsr\input_digest.py` - deterministic digest mode for very large inputs
+- `lsr\memory.py` - process RAM/VRAM footprint checks and release hooks
 - `lsr\registry.py` - server-side signature registry and stale-file refresh
+- `lsr\scoring.py` - lexical/generic/repetition diagnostics and score helpers
 - `lsr\signatures.py` - signature building, loading, saving, and DER codec
 - `lsr\routing.py` - layered routing, lazy loading policy, and hierarchical search
 - `requirements.txt` - Python dependencies
@@ -181,14 +183,16 @@ Default runtime behavior:
 
 ```text
 1. load metadata for all facets
-2. load and keep global L1 warm
-3. score every facet on L1
-4. descend only facets whose current layer decision is `passed`
-5. load deeper layers on demand
-6. unload L2+ after the request; keep only L1 warm
+2. load one needed layer from one .sig file
+3. score that layer
+4. copy only scalar diagnostics/candidate ids
+5. release that layer from RAM/VRAM immediately
+6. descend only facets whose current layer decision is `passed`
 ```
 
-For memory-constrained runs, pass `--memory-limit-mb N`. In that mode, L1 is processed in chunks: load what fits, compare, unload, then continue with the next chunk. After the route finishes, all loaded layers are released.
+There is no persistent global L1 index in runtime routing. `loadingPolicy=streaming-release-layer` means each layer is read with `seek/read`, compared, and removed before the next layer is loaded.
+
+For memory-constrained runs, pass `--memory-limit-mb N`. The limit is checked against the current process RAM plus tracked CUDA VRAM before loading each layer or candidate view. If the model/process already exceeds the limit, routing fails clearly instead of loading more signature data.
 
 Layer decisions use per-layer thresholds from `lsr\defaults.json`:
 
@@ -211,7 +215,7 @@ Default config shape:
 
 Routing depth is no longer decided by top-k or a fixed number of accepted facets. `--top-k` only limits how many sorted results are returned after all threshold decisions have been evaluated.
 
-For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON and table output include each layer score, threshold, decision, confidence decay, and entropy.
+For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON output includes each layer score, threshold, decision, confidence decay, entropy, plus facet-level `semanticScore`, `confidence`, `separation`, `anchorSimilarity`, `lexicalScore`, `genericPenalty`, and `repetitionPenalty`.
 
 Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
 
@@ -317,7 +321,7 @@ Invoke-RestMethod `
 
 Supported endpoints:
 
-- `GET /health` - returns model, loading policy, cache policy, thresholds, signature path, loaded facets, loaded layers, loaded vector bytes, signature files, stale signatures, and default `top_k`
+- `GET /health` - returns model, loading policy, cache policy, process RAM/VRAM, thresholds, signature path, loaded facets, loaded layers, loaded vector bytes, signature files, stale signatures, and default `top_k`
 - `POST /rank` - accepts `{"input": "..."}`; `prompt`, `text`, `full_depth`, and `large_input` are also accepted
 - `POST /route` - compatibility alias for `/rank`
 - `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts`, `texts`, `full_depth`, and `large_input` are also accepted
@@ -453,7 +457,7 @@ python router.py evaluate `
   --output sweep-report.json
 ```
 
-The report includes recall@1, recall@3, MRR, false-positive rate, refused rate, per-layer accepted/passed/refused counts, confidence-decay stats, latency p50/p95/p99, traced memory, and loaded vector bytes.
+The report includes recall@1, recall@3, MRR, false-positive rate, refused rate, per-layer accepted/passed/refused counts, confidence/separation/decay stats, lexical/generic/repetition diagnostics, latency p50/p95/p99, process RAM/VRAM footprint, and loaded vector bytes.
 
 ## Other Supported Dataset Shapes
 
@@ -505,7 +509,7 @@ Common runtime options:
 --PU N|auto           Use processing unit index N, or auto-select a usable PU
 --index auto|flat|hnsw
                        Vector index backend; auto uses global L1 FlatIP and HNSW for large layers
---memory-limit-mb N   0 keeps L1 warm; >0 enables chunked lazy loading under this memory budget
+--memory-limit-mb N   0 disables the limit; >0 checks total RAM/VRAM before each layer load
 --descend-threshold N Override all per-layer pass thresholds from defaults.json
 --accept-threshold N  Override all per-layer accept thresholds from defaults.json
 --large-input auto|off|force

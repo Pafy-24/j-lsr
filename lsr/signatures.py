@@ -22,6 +22,8 @@ class SignatureLayerRef:
     end: int
     level: int
     vector_count: int
+    encoded_bytes: int
+    vector_bytes: int
 
 
 def read_tlv_view(
@@ -209,6 +211,8 @@ class SignatureCodec:
                     end=layer_offset,
                     level=level,
                     vector_count=vector_bytes // row_size,
+                    encoded_bytes=layer_offset - layer_start,
+                    vector_bytes=vector_bytes,
                 )
                 if layer_payload_end > layer_offset:
                     raise RouterError(f"Invalid layer bounds in signature: {path}")
@@ -234,6 +238,7 @@ class SignatureCodec:
             normalize=bool(metadata["normalize"]),
             distance_metric=str(metadata["distance_metric"]),
             layer_sizes={level: ref.vector_count for level, ref in refs.items()},
+            layer_byte_sizes={level: ref.encoded_bytes for level, ref in refs.items()},
             layer_loader=load_layer,
         )
 
@@ -284,6 +289,7 @@ class SignatureCodec:
             normalize=True,
             distance_metric="cosine",
             layer_sizes={1: len(matrix)},
+            layer_byte_sizes={1: int(matrix.nbytes)},
         )
 
 
@@ -364,6 +370,7 @@ class SignatureBuilder:
             layers=layers,
             normalize=True,
             distance_metric="cosine",
+            layer_byte_sizes={level: int(layer.vectors.nbytes) for level, layer in layers.items()},
         )
 
 

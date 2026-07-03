@@ -9,6 +9,7 @@ from .console import console
 from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .input_digest import prepare_routing_input
+from .memory import current_process_ram_bytes, current_vram_bytes
 from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import LayeredSignature
 from .registry import SignatureRegistry
@@ -57,7 +58,7 @@ class LSRRouteService:
             memory_limit_mb=self.memory_limit_mb,
             descend_threshold=self.descend_threshold,
             accept_threshold=self.accept_threshold,
-            cache_policy="release_all" if self.memory_limit_mb else "keep_l1_only",
+            cache_policy="release_after_layer",
         )
 
     def health(self) -> dict[str, Any]:
@@ -70,6 +71,8 @@ class LSRRouteService:
             "index_backend": self.router.index_backend_label(),
             "loading_policy": self.router.loading_policy_label(),
             "memory_limit_mb": self.memory_limit_mb,
+            "processRamBytes": current_process_ram_bytes(),
+            "processVramBytes": current_vram_bytes(),
             "thresholds": self.router.thresholds_label(),
             "cachePolicy": self.router.cache_policy_label(),
             "loadedLayers": self.registry.loaded_layers(),

@@ -27,6 +27,13 @@
     "search_l1_top": 3,
     "search_next_top": 12,
     "search_exact_max": 512,
+    "semantic_units": {
+      "max_units": 6,
+      "min_chars": 5,
+      "max_unit_chars": 900,
+      "global_weight": 0.35,
+      "best_unit_weight": 0.65
+    },
     "layer_thresholds": {
       "default": {
         "pass": 0.18,
@@ -57,11 +64,11 @@
       "anchor_weight": 0.55,
       "top_average_weight": 0.25,
       "layer_weight": 0.20,
-      "lexical_weight": 0.05,
-      "generic_penalty": 0.05,
-      "repetition_penalty": 0.08,
+      "lexical_weight": 0.0,
+      "generic_penalty": 0.0,
+      "repetition_penalty": 0.0,
       "separation": {
-        "enabled": true,
+        "enabled": false,
         "min_top_delta": 0.08,
         "ratio_threshold": 0.72,
         "penalty": 0.12,

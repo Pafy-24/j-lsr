@@ -35,48 +35,6 @@ STOPWORDS = {
     "with",
 }
 
-FACET_KEYWORDS = {
-    "crypto": {
-        "aes",
-        "rsa",
-        "dsa",
-        "ecdsa",
-        "ed25519",
-        "signature",
-        "verify",
-        "hash",
-        "cipher",
-        "encryption",
-        "decrypt",
-        "key",
-        "nonce",
-        "pqc",
-        "kyber",
-        "dilithium",
-        "tls",
-        "certificate",
-    },
-    "web": {
-        "html",
-        "css",
-        "javascript",
-        "typescript",
-        "react",
-        "vue",
-        "frontend",
-        "backend",
-        "browser",
-        "dom",
-        "api",
-        "http",
-        "url",
-        "seo",
-        "layout",
-        "component",
-        "form",
-    },
-}
-
 GENERIC_TOKENS = {
     "help",
     "question",
@@ -101,16 +59,8 @@ def tokens(text: str) -> list[str]:
 
 
 def lexical_score(text: str, facet: str) -> float:
-    text_tokens = set(tokens(text))
-    if not text_tokens:
-        return 0.0
-    facet_key = facet.strip().lower()
-    keywords = set(tokens(facet_key.replace("_", " ")))
-    keywords.update(FACET_KEYWORDS.get(facet_key, set()))
-    if not keywords:
-        return 0.0
-    matches = text_tokens & keywords
-    return min(1.0, len(matches) / max(3, min(len(keywords), len(text_tokens))))
+    """Compatibility diagnostic; routing never uses facet-specific vocabulary."""
+    return 0.0
 
 
 def generic_penalty(text: str) -> float:

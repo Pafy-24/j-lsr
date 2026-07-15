@@ -6,6 +6,8 @@ from .config import (
     SEARCH_EXACT_MAX,
     SEARCH_L1_TOP,
     SEARCH_NEXT_TOP,
+    SEMANTIC_GLOBAL_WEIGHT,
+    SEMANTIC_BEST_UNIT_WEIGHT,
     DEFAULT_CACHE_POLICY,
     CONFIDENCE_DECAY_ENABLED,
     CONFIDENCE_DECAY_MAX_DELTA,
@@ -14,9 +16,6 @@ from .config import (
     SCORING_ANCHOR_WEIGHT,
     SCORING_TOP_AVERAGE_WEIGHT,
     SCORING_LAYER_WEIGHT,
-    SCORING_LEXICAL_WEIGHT,
-    SCORING_GENERIC_PENALTY,
-    SCORING_REPETITION_PENALTY,
     SEPARATION_ENABLED,
     SEPARATION_MIN_TOP_DELTA,
     SEPARATION_RATIO_THRESHOLD,
@@ -28,10 +27,10 @@ from .config import (
 from .dependencies import ensure_numpy
 from .errors import RouterError
 from .indexes import build_index
-from .memory import current_footprint_bytes, format_bytes, release_unused_memory
+from .memory import current_footprint_bytes, format_bytes
 from .models import LayeredSignature
 from .routing_policy import child_ids, top_indices
-from .scoring import confidence_from_score, generic_penalty, lexical_score, repetition_penalty, weighted_layer_score
+from .scoring import confidence_from_score, weighted_layer_score
 
 
 class LSRRouter:
@@ -46,6 +45,8 @@ class LSRRouter:
         accept_threshold: float | None = None,
         full_depth: bool = False,
         cache_policy: str = DEFAULT_CACHE_POLICY,
+        status_callback: Any = None,
+        memory_callback: Any = None,
     ):
         if top_k < 1:
             raise RouterError("--top-k must be at least 1.")
@@ -61,11 +62,14 @@ class LSRRouter:
         self.accept_threshold = None if accept_threshold is None else float(accept_threshold)
         self.full_depth = full_depth
         self.cache_policy = cache_policy
+        self.status_callback = status_callback
+        self.memory_callback = memory_callback
         self.layer_indexes: dict[tuple[str, int], Any] = {}
         self.global_l1_entries: list[tuple[str, int]] = []
         self.global_l1_index: Any = None
         self.index_backends: set[str] = set()
         self.last_l1_scanned = 0
+        self._reset_memory_metrics()
         self.build_indexes()
 
     def route(
@@ -84,6 +88,7 @@ class LSRRouter:
             self.full_depth = original_full_depth
 
     def _route(self, prompt: str, prompt_embedding: Any, display_limit: int) -> dict[str, Any]:
+        self._reset_memory_metrics()
         coarse_results = self.global_l1_search(prompt_embedding)
 
         results: list[dict[str, Any]] = []
@@ -92,7 +97,11 @@ class LSRRouter:
             result = dict(coarse_by_facet[facet])
             decision = str(result.get("decision", "refused"))
             if decision == "passed" or self.full_depth:
-                results.append(self.search_signature(signature, prompt, prompt_embedding))
+                results.append(
+                    self.search_signature(
+                        signature, prompt, prompt_embedding, coarse_result=result
+                    )
+                )
             else:
                 self.apply_scoring_diagnostics(
                     result,
@@ -131,7 +140,14 @@ class LSRRouter:
             "loadingPolicy": self.loading_policy_label(),
             "thresholds": self.thresholds_label(),
             "fullDepth": self.full_depth,
+            "queryUnits": int(prompt_embedding.shape[0])
+            if getattr(prompt_embedding, "ndim", 1) > 1
+            else 1,
+            "signatureMemory": self.signature_memory_report(results),
         }
+        route["similarityEvaluationsUpperBound"] = int(route["vectorsScanned"]) * int(
+            route["queryUnits"]
+        )
         self.release_after_route()
         return route
 
@@ -193,13 +209,111 @@ class LSRRouter:
                 signature.estimated_layer_bytes(level),
                 f"{signature.facet} L{level}",
             )
-        return signature.get_layer(level)
+        layer = signature.get_layer(level)
+        vector_bytes = int(getattr(layer.vectors, "nbytes", 0))
+        key = (signature.facet, level)
+        if key not in self._resident_layer_bytes:
+            self._resident_layer_bytes[key] = vector_bytes
+            self._resident_signature_bytes += vector_bytes
+            self._peak_resident_signature_bytes = max(
+                self._peak_resident_signature_bytes, self._resident_signature_bytes
+            )
+        self._total_layer_bytes_read += vector_bytes
+        self._layer_load_count += 1
+        level_stats = self._memory_by_level.setdefault(
+            level, {"loads": 0, "bytesRead": 0, "maxLayerBytes": 0, "facets": set()}
+        )
+        level_stats["loads"] += 1
+        level_stats["bytesRead"] += vector_bytes
+        level_stats["maxLayerBytes"] = max(int(level_stats["maxLayerBytes"]), vector_bytes)
+        level_stats["facets"].add(signature.facet)
+        if self.status_callback:
+            self.status_callback(
+                "routing",
+                f"{signature.facet} L{level}: {len(layer.vectors)} vectors, {format_bytes(vector_bytes)}",
+            )
+        if self.memory_callback:
+            self.memory_callback(
+                "set",
+                "RAM",
+                f"signature:{signature.facet}:L{level}",
+                vector_bytes,
+                "NumPy vectors",
+            )
+        return layer
 
     def release_layer(self, signature: LayeredSignature, level: int) -> None:
         signature.release_layer(level)
+        released = self._resident_layer_bytes.pop((signature.facet, level), 0)
+        self._resident_signature_bytes = max(0, self._resident_signature_bytes - released)
+        if self.memory_callback:
+            self.memory_callback(
+                "remove", "RAM", f"signature:{signature.facet}:L{level}", 0, ""
+            )
 
     def release_memory(self) -> None:
-        release_unused_memory()
+        # Dropping every layer reference is enough on the hot path.  Forcing a
+        # full GC, CUDA cache flush and Windows working-set trim after each
+        # matrix multiplication synchronizes the GPU and causes second-scale
+        # latency. Aggressive cleanup remains available to explicit lifecycle
+        # operations, but never runs between layers of a request.
+        return
+
+    def _reset_memory_metrics(self) -> None:
+        self._resident_layer_bytes: dict[tuple[str, int], int] = {}
+        self._resident_signature_bytes = 0
+        self._peak_resident_signature_bytes = 0
+        self._total_layer_bytes_read = 0
+        self._layer_load_count = 0
+        self._memory_by_level: dict[int, dict[str, Any]] = {}
+
+    def signature_memory_report(self, results: list[dict[str, Any]]) -> dict[str, Any]:
+        eager_all = 0
+        all_l1 = 0
+        for signature in self.signatures.values():
+            levels = signature.levels()
+            eager_all += sum(signature.estimated_layer_bytes(level) for level in levels)
+            if levels:
+                all_l1 += signature.estimated_layer_bytes(levels[0])
+        by_level = {
+            str(level): {
+                "loads": int(stats["loads"]),
+                "bytesRead": int(stats["bytesRead"]),
+                "maxLayerBytes": int(stats["maxLayerBytes"]),
+                "facets": sorted(stats["facets"]),
+                "facetCount": len(stats["facets"]),
+            }
+            for level, stats in sorted(self._memory_by_level.items())
+        }
+        peak = self._peak_resident_signature_bytes
+        facet_count = len(self.signatures)
+        average_l1 = (all_l1 / facet_count) if facet_count else 0.0
+        average_all = (eager_all / facet_count) if facet_count else 0.0
+        return {
+            "policy": self.loading_policy_label(),
+            "facetCount": facet_count,
+            "eagerAllLayersBytes": eager_all,
+            "allFacetL1Bytes": all_l1,
+            "peakResidentVectorBytes": peak,
+            "residentVectorBytesAfterRank": self._resident_signature_bytes,
+            "totalLayerBytesRead": self._total_layer_bytes_read,
+            "layerLoadCount": self._layer_load_count,
+            "avoidedPeakBytesVsEager": max(0, eager_all - peak),
+            "peakFractionOfEager": (peak / eager_all) if eager_all else 0.0,
+            "byLevel": by_level,
+            "descendedFacets": sorted(
+                str(result["facet"])
+                for result in results
+                if any(int(layer.get("level", 0)) > 1 for layer in result.get("layers", []))
+            ),
+            "scalingProjection": {
+                str(count): {
+                    "allL1Bytes": int(average_l1 * count),
+                    "eagerAllLayersBytes": int(average_all * count),
+                }
+                for count in (100, 1000, 10000)
+            },
+        }
 
     def layer_decision(self, level: int, score: float) -> str:
         thresholds = self.thresholds_for(level)
@@ -266,12 +380,13 @@ class LSRRouter:
         semantic_score: float,
         anchor_similarity: float = 0.0,
     ) -> dict[str, Any]:
-        has_prompt = bool(prompt.strip())
         result["semanticScore"] = float(semantic_score)
         result["anchorSimilarity"] = float(anchor_similarity)
-        result["lexicalScore"] = lexical_score(prompt, str(result["facet"])) if has_prompt else 0.0
-        result["genericPenalty"] = generic_penalty(prompt) if has_prompt else 0.0
-        result["repetitionPenalty"] = repetition_penalty(prompt) if has_prompt else 0.0
+        # Retain the fields for report compatibility.  They are deliberately
+        # neutral: a new facet must be routable from its signature alone.
+        result["lexicalScore"] = 0.0
+        result["genericPenalty"] = 0.0
+        result["repetitionPenalty"] = 0.0
         last_layer = result.get("layers", [{}])[-1]
         result["confidence"] = confidence_from_score(
             float(result["semanticScore"]),
@@ -279,21 +394,7 @@ class LSRRouter:
             float(last_layer.get("acceptThreshold", 1.0)),
         )
         result["separation"] = 0.0
-        result["score"] = (
-            float(result["semanticScore"])
-            + (SCORING_LEXICAL_WEIGHT * float(result["lexicalScore"]))
-            - (SCORING_GENERIC_PENALTY * float(result["genericPenalty"]))
-            - (SCORING_REPETITION_PENALTY * float(result["repetitionPenalty"]))
-        )
-        if (
-            has_prompt
-            and
-            float(result["genericPenalty"]) >= 0.5
-            and float(result["confidence"]) < 0.12
-            and str(result.get("decision")) in {"accepted", "passed"}
-        ):
-            result["decision"] = "refused"
-            result["mode"] = f"{result.get('mode', '')} generic-refused".strip()
+        result["score"] = float(result["semanticScore"])
         return result
 
     def apply_separation(self, results: list[dict[str, Any]]) -> None:
@@ -307,15 +408,9 @@ class LSRRouter:
             ratio = score / top_score if top_score > 0 else 0.0
             result["separation"] = delta
             result["separationRatio"] = ratio
-            if rank == 0 or not SEPARATION_ENABLED:
-                continue
-            weak_delta = delta >= SEPARATION_REFUSE_DELTA
-            weak_ratio = ratio < SEPARATION_RATIO_THRESHOLD and delta >= SEPARATION_MIN_TOP_DELTA
-            if weak_delta or weak_ratio:
-                result["score"] = score - SEPARATION_PENALTY
-                if str(result.get("decision")) in {"accepted", "passed"}:
-                    result["decision"] = "refused"
-                    result["mode"] = f"{result.get('mode', '')} separation-refused".strip()
+            # Separation is diagnostic only. Each facet makes an independent
+            # threshold decision so genuinely mixed prompts can activate more
+            # than one signature.
 
     def facets_by_decision(self, results: list[dict[str, Any]]) -> dict[str, list[str]]:
         grouped = {"accepted": [], "passed": [], "refused": []}
@@ -368,6 +463,11 @@ class LSRRouter:
                         "layers": [trace],
                     }
                 )
+                if trace["decision"] == "passed" and len(levels) > 1:
+                    next_limit = SEARCH_EXACT_MAX if levels[1] == levels[-1] else None
+                    result["_next_candidate_ids"] = child_ids(
+                        layer.links, [int(index) for index in top], next_limit
+                    )
                 self.apply_scoring_diagnostics(result, "", score, 0.0)
                 results.append(result)
             finally:
@@ -408,7 +508,13 @@ class LSRRouter:
             del layer
             self.release_memory()
 
-    def search_signature(self, signature: LayeredSignature, prompt: str, prompt_embedding: Any) -> dict[str, Any]:
+    def search_signature(
+        self,
+        signature: LayeredSignature,
+        prompt: str,
+        prompt_embedding: Any,
+        coarse_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         np = ensure_numpy()
         levels = signature.levels()
         last_level = levels[-1]
@@ -444,7 +550,16 @@ class LSRRouter:
         best_cluster_score = 0.0
         vectors_scanned = 0
         traces: list[dict[str, Any]] = []
-        for position, level in enumerate(levels[:-1]):
+        start_position = 0
+        if coarse_result is not None and coarse_result.get("_next_candidate_ids") is not None:
+            candidate_ids = list(coarse_result["_next_candidate_ids"])
+            traces = [dict(trace) for trace in coarse_result.get("layers", [])]
+            best_cluster_score = float(coarse_result.get("cluster_score", 0.0))
+            # L1 comparisons are already counted once in global_l1_search.
+            vectors_scanned = 0
+            start_position = 1
+        for position in range(start_position, len(levels) - 1):
+            level = levels[position]
             layer = self.load_layer(signature, level)
             try:
                 if candidate_ids is None:
@@ -459,7 +574,7 @@ class LSRRouter:
                         len(candidate_ids) * signature.dimension * 4,
                         f"{signature.facet} L{level} candidate view",
                     )
-                    scores = layer.vectors[candidate_ids] @ prompt_embedding
+                    scores = self.score_vectors(layer.vectors[candidate_ids], prompt_embedding)
                     limit = SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP
                     top_local = top_indices(scores, limit)
                     top_scores = [float(scores[index]) for index in top_local]
@@ -543,7 +658,7 @@ class LSRRouter:
                 len(candidates) * signature.dimension * 4,
                 f"{signature.facet} L{last_level} exact candidate view",
             )
-            candidate_scores = last_layer.vectors[candidates] @ prompt_embedding
+            candidate_scores = self.score_vectors(last_layer.vectors[candidates], prompt_embedding)
             top_candidate_local = top_indices(candidate_scores, min(5, len(candidate_scores)))
             best_local = top_candidate_local[0]
             best_index = int(candidates[best_local])
@@ -600,20 +715,51 @@ class LSRRouter:
             and not self.memory_limit_bytes
             and (self.index_policy == "hnsw" or len(vectors) > INDEX_HNSW_THRESHOLD)
         )
+        query_matrix = np.asarray(query, dtype=np.float32)
+        if query_matrix.ndim == 1:
+            query_matrix = query_matrix.reshape(1, -1)
         if use_index:
             index = build_index(vectors, self.index_policy, level)
             self.index_backends.add(index.backend)
             try:
-                matches = index.search(query, active_limit)
-                return [match.index for match in matches], [match.score for match in matches]
+                if len(query_matrix) == 1:
+                    matches = index.search(query_matrix[0], active_limit)
+                    return [match.index for match in matches], [match.score for match in matches]
+                candidate_ids: set[int] = set()
+                for unit_query in query_matrix:
+                    candidate_ids.update(
+                        match.index for match in index.search(unit_query, active_limit)
+                    )
+                ordered_candidates = sorted(candidate_ids)
+                aggregate = self.score_vectors(vectors[ordered_candidates], query_matrix)
+                top_local = top_indices(aggregate, active_limit)
+                return (
+                    [int(ordered_candidates[index]) for index in top_local],
+                    [float(aggregate[index]) for index in top_local],
+                )
             finally:
                 del index
                 self.release_memory()
 
-        scores = vectors @ query
+        scores = self.score_vectors(vectors, query_matrix)
         top = top_indices(scores, active_limit)
         self.index_backends.add("flat")
         return [int(index) for index in top], [float(scores[index]) for index in top]
+
+    def score_vectors(self, vectors: Any, query: Any) -> Any:
+        np = ensure_numpy()
+        query_matrix = np.asarray(query, dtype=np.float32)
+        if query_matrix.ndim == 1:
+            return vectors @ query_matrix
+        similarities = vectors @ query_matrix.T
+        if query_matrix.shape[0] == 1:
+            return similarities[:, 0]
+        global_scores = similarities[:, 0]
+        best_unit_scores = np.max(similarities, axis=1)
+        return (
+            SEMANTIC_GLOBAL_WEIGHT * global_scores
+            + SEMANTIC_BEST_UNIT_WEIGHT * best_unit_scores
+        )
 
 
 def coarse_search_signature(signature: LayeredSignature, prompt_embedding: Any) -> dict[str, Any]:
@@ -675,14 +821,19 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
         "modelName": route.get("modelName", ""),
         "indexBackend": route.get("indexBackend", ""),
         "vectorsScanned": route.get("vectorsScanned", 0),
+        "similarityEvaluationsUpperBound": route.get("similarityEvaluationsUpperBound", 0),
         "activeFacets": route.get("activeFacets", {}),
         "loadingPolicy": route.get("loadingPolicy", ""),
         "thresholds": route.get("thresholds", {}),
         "fullDepth": route.get("fullDepth", False),
+        "signatureMemory": route.get("signatureMemory", {}),
+        "performance": route.get("performance", {}),
         "inputMode": route.get("inputMode", "raw"),
         "inputChars": route.get("inputChars", len(str(route.get("input", "")))),
         "routingTextChars": route.get("routingTextChars", len(str(route.get("input", "")))),
         "chunksUsed": route.get("chunksUsed", 1 if route.get("input") else 0),
+        "routingUnits": route.get("routingUnits", route.get("queryUnits", 1)),
+        "queryUnits": route.get("queryUnits", 1),
         "results": [
             {
                 "rank": index,

@@ -141,6 +141,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start without loading initial signatures. Use loadsig later.",
     )
+    serve.add_argument(
+        "--no-monitor",
+        action="store_true",
+        help="Disable the real-time processing-unit and memory dashboard.",
+    )
+    serve.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Bounded HTTP worker threads. Requests are serialized around the shared router. Default: 4",
+    )
 
     loadsig = subparsers.add_parser(
         "loadsig",

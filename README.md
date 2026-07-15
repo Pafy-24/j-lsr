@@ -407,6 +407,52 @@ facets
             `-- [facet]_finetune.jsonl
 ```
 
+The server terminal displays a live dashboard by default. It shows the current
+routing/embedding operation, CPU and GPU utilization, process RAM, CUDA VRAM,
+loaded signature layers, vector bytes, request count, and last-request latency.
+RAM and VRAM inventories are separate and attribute memory to the embedding
+model, signature metadata, active vector layers, CUDA allocator cache, and
+unattributed runtime/native allocations. The same tracked allocations are
+available as `memoryComponents` from `GET /health`.
+Model parameter and buffer bytes are counted from their actual tensor devices.
+The RAM delta caused by importing PyTorch/Transformers, loading the tokenizer,
+CUDA driver mappings, and native libraries is reported separately as
+`embedding-framework/tokenizer/driver`; it is not presented as a CPU copy of
+GPU model weights.
+
+Every `/rank` response includes `performance.timing` (`rankingMs`,
+`embeddingMs`, `routingMs`, and process `cpuTimeMs`) plus per-request RAM and
+CUDA allocator peaks under `performance.resources`. The terminal rank output
+prints both transient peak and retained-after-rank deltas. The server does not
+run inference warm-up by default: PyTorch CUDA warm-up was measured to retain
+roughly 500 MB of additional native working memory on this Windows setup. The
+first rank therefore includes lazy backend initialization, while subsequent
+ranks show steady-state cost. The dashboard retains the last rank's
+peaks, also exposed as `lastRankPerformance` by `GET /health`.
+On Windows, per-rank resources distinguish volatile physical working set from
+process Private Bytes; the latter is the better retained-allocation/leak signal.
+
+Each rank also reports `signatureMemory`: the theoretical vector RAM required
+to load every layer eagerly, the size of all facets' L1 layers, the measured
+peak simultaneously resident vector bytes under the streaming policy, total
+layer bytes read, loads and facet counts per level, and the facets that
+descended beyond L1. This makes memory scaling measurable without actually
+loading hundreds or thousands of complete signatures at once.
+It also projects the observed average signature sizes to 100, 1,000, and
+10,000 facets for both all-L1-resident and eager-all-layers policies.
+
+Short and large inputs share the same bounded semantic-unit pipeline. At most
+six units (global input plus domain-neutral clauses/chunks) are embedded in one
+batch. Every signature layer is loaded once and scored with one matrix
+multiplication against the unit matrix; `similarityEvaluationsUpperBound`
+reports the bounded vector-by-unit work. Scores combine 35% global similarity
+and 65% best-unit similarity, preserving overall intent while allowing mixed
+facets to activate independently.
+Use `--no-monitor` for redirected logs or non-interactive service deployments.
+The HTTP server uses a bounded worker pool (`--workers 4` by default), avoiding
+the native thread-local memory growth caused by creating one PyTorch request
+thread per connection.
+
 `*_pretrain.jsonl` uses one plain text per line:
 
 ```json

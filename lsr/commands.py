@@ -17,9 +17,10 @@ from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .input_digest import prepare_routing_input, prepare_routing_input_from_path
 from .io_utils import load_batch_prompts, read_file, read_stdin_if_available, read_text_arg
-from .memory import current_footprint_bytes
+from .memory import current_footprint_bytes, format_bytes
 from .model_selection import resolve_model_name, validate_signature_model_compatibility
 from .models import FacetSignature
+from .profiling import RankProfiler
 from .routing import LSRRouter, json_ready_route
 from .server import serve
 from .signatures import SignatureBuilder, SignatureStore
@@ -120,7 +121,12 @@ class RouterCLI:
         model = load_model(model_name, self.args.PU, self.args.online)
         if routing_input is None:
             routing_input = prepare_routing_input(prompt, self.args.large_input)
-        prompt_embedding = embed_texts(model, [routing_input.routing_text])[0]
+        profiler = RankProfiler()
+        profiler.start()
+        embedding_started = time.perf_counter()
+        prompt_embedding = embed_texts(model, routing_input.routing_units)
+        profiler.stage("embedding", embedding_started)
+        routing_started = time.perf_counter()
         route = LSRRouter(
             signatures,
             self.args.top_k,
@@ -131,6 +137,8 @@ class RouterCLI:
             accept_threshold=self.args.accept_threshold,
             full_depth=self.args.full_depth,
         ).route(routing_input.routing_text, prompt_embedding)
+        profiler.stage("routing", routing_started)
+        route["performance"] = profiler.finish()
         attach_input_metadata(route, routing_input)
 
         if self.args.json:
@@ -151,7 +159,8 @@ class RouterCLI:
         prompts = load_batch_prompts(raw)
         model = load_model(model_name, self.args.PU, self.args.online)
         routing_inputs = [prepare_routing_input(prompt, self.args.large_input) for prompt in prompts]
-        embeddings = embed_texts(model, [item.routing_text for item in routing_inputs])
+        flat_units = [unit for item in routing_inputs for unit in item.routing_units]
+        embeddings = embed_texts(model, flat_units)
         router = LSRRouter(
             signatures,
             self.args.top_k,
@@ -162,13 +171,20 @@ class RouterCLI:
             accept_threshold=self.args.accept_threshold,
             full_depth=self.args.full_depth,
         )
-        routes = [
-            with_input_metadata(
-                router.route(routing_inputs[index].routing_text, embeddings[index]),
-                routing_inputs[index],
+        routes = []
+        offset = 0
+        for routing_input in routing_inputs:
+            unit_count = len(routing_input.routing_units)
+            routes.append(
+                with_input_metadata(
+                    router.route(
+                        routing_input.routing_text,
+                        embeddings[offset : offset + unit_count],
+                    ),
+                    routing_input,
+                )
             )
-            for index, _prompt in enumerate(prompts)
-        ]
+            offset += unit_count
         print(json.dumps([json_ready_route(route) for route in routes], ensure_ascii=False))
 
     def serve(self) -> None:
@@ -189,6 +205,8 @@ class RouterCLI:
             descend_threshold=self.args.descend_threshold,
             accept_threshold=self.args.accept_threshold,
             load_initial_signatures=not self.args.no_load,
+            monitor_enabled=not self.args.no_monitor,
+            workers=self.args.workers,
         )
 
     def loadsig(self) -> None:
@@ -291,8 +309,9 @@ class RouterCLI:
             ranks: list[int | None] = []
             for prompt, expected_facets in zip(prompts, expected):
                 route_started = time.perf_counter()
-                embedding = embed_texts(model, [prompt])[0]
-                route = router.route(prompt, embedding)
+                routing_input = prepare_routing_input(prompt, "auto")
+                embedding = embed_texts(model, routing_input.routing_units)
+                route = router.route(routing_input.routing_text, embedding)
                 latencies_ms.append((time.perf_counter() - route_started) * 1000)
                 facets = [str(result["facet"]).lower() for result in route["results"]]
                 expected_set = {facet.lower() for facet in expected_facets}
@@ -394,12 +413,19 @@ class RouterCLI:
         lexical_scores: list[float] = []
         generic_penalties: list[float] = []
         repetition_penalties: list[float] = []
+        # Warm the embedding/CUDA kernels and one routing path before taking
+        # the memory baseline; otherwise lazy backend initialization is
+        # incorrectly reported as per-evaluation signature growth.
+        if prompts:
+            warm_input = prepare_routing_input(prompts[0], self.args.large_input)
+            warm_embedding = embed_texts(model, warm_input.routing_units)
+            router.route(warm_input.routing_text, warm_embedding)
         before_memory = process_memory_mb()
 
         for prompt, expected_facets in zip(prompts, expected):
             routing_input = prepare_routing_input(prompt, self.args.large_input)
             started = time.perf_counter()
-            embedding = embed_texts(model, [routing_input.routing_text])[0]
+            embedding = embed_texts(model, routing_input.routing_units)
             route = router.route(routing_input.routing_text, embedding)
             latencies_ms.append((time.perf_counter() - started) * 1000)
             results = route["results"]
@@ -480,8 +506,6 @@ def print_signature_summary(signatures: list[FacetSignature]) -> None:
             f"{signature.facet}.sig",
         )
     console.print(table)
-
-
 def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
     top_results = route["results"]
 
@@ -503,6 +527,44 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
             format_layer_trace(result.get("layers", [])),
         )
     console.print(table)
+    performance = route.get("performance", {})
+    timing = performance.get("timing", {}) if isinstance(performance, dict) else {}
+    if timing:
+        console.print(
+            "[dim]Timing: "
+            f"rank {float(timing.get('rankingMs', 0.0)):.3f} ms | "
+            f"embedding {float(timing.get('embeddingMs', 0.0)):.3f} ms | "
+            f"routing {float(timing.get('routingMs', 0.0)):.3f} ms | "
+            f"CPU {float(timing.get('cpuTimeMs', 0.0)):.3f} ms[/dim]"
+        )
+        resources = performance.get("resources", {})
+        cuda = resources.get("cuda", []) if isinstance(resources, dict) else []
+        cuda_peak = sum(int(item.get("peakAllocatedDeltaBytes", 0)) for item in cuda)
+        cuda_retained = sum(int(item.get("allocatedRetainedDeltaBytes", 0)) for item in cuda)
+        console.print(
+            "[dim]Peak during rank: "
+            f"RAM +{format_bytes(int(resources.get('ramPeakDeltaBytes', 0)))} | "
+            f"CUDA allocated +{format_bytes(cuda_peak)}[/dim]"
+        )
+        console.print(
+            "[dim]Retained after rank: "
+            f"working set {format_signed_bytes(int(resources.get('ramRetainedDeltaBytes', 0)))} | "
+            f"private {format_signed_bytes(int(resources.get('privateRetainedDeltaBytes', 0)))} | "
+            f"CUDA allocated {format_signed_bytes(cuda_retained)}[/dim]"
+        )
+    signature_memory = route.get("signatureMemory", {})
+    if isinstance(signature_memory, dict) and signature_memory:
+        peak = int(signature_memory.get("peakResidentVectorBytes", 0))
+        eager = int(signature_memory.get("eagerAllLayersBytes", 0))
+        l1 = int(signature_memory.get("allFacetL1Bytes", 0))
+        read = int(signature_memory.get("totalLayerBytesRead", 0))
+        fraction = float(signature_memory.get("peakFractionOfEager", 0.0)) * 100.0
+        console.print(
+            "[dim]Signature memory: "
+            f"peak {format_bytes(peak)} ({fraction:.2f}% of eager) | "
+            f"all L1 {format_bytes(l1)} | all layers {format_bytes(eager)} | "
+            f"read {format_bytes(read)}[/dim]"
+        )
 
     if args.debug:
         prompt = route["input"]
@@ -542,11 +604,17 @@ def format_layer_trace(layers: list[dict[str, Any]]) -> str:
     return " | ".join(parts)
 
 
+def format_signed_bytes(size: int) -> str:
+    sign = "+" if size > 0 else "-" if size < 0 else ""
+    return f"{sign}{format_bytes(abs(size))}"
+
+
 def attach_input_metadata(route: dict[str, Any], routing_input: Any) -> None:
     route["inputMode"] = routing_input.input_mode
     route["inputChars"] = routing_input.input_chars
     route["routingTextChars"] = routing_input.routing_text_chars
     route["chunksUsed"] = routing_input.chunks_used
+    route["routingUnits"] = len(routing_input.routing_units)
 
 
 def with_input_metadata(route: dict[str, Any], routing_input: Any) -> dict[str, Any]:

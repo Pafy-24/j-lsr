@@ -11,12 +11,19 @@ from .config import (
     LARGE_INPUT_LAST_CHUNKS,
     LARGE_INPUT_MAX_DIGEST_CHARS,
     LARGE_INPUT_THRESHOLD_CHARS,
+    SEMANTIC_MAX_UNITS,
+    SEMANTIC_MIN_CHARS,
+    SEMANTIC_MAX_UNIT_CHARS,
 )
 from .dataset import compact_whitespace, technical_terms
 
 
 HEADING_PATTERN = re.compile(r"^\s{0,3}(#{1,6}\s+.+|<h[1-6][^>]*>.*?</h[1-6]>)\s*$", re.IGNORECASE)
 TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+SEMANTIC_BOUNDARY_PATTERN = re.compile(
+    r"(?:\r?\n\s*\r?\n|(?<=[.!?;])\s+|\s+(?:about|regarding|despre|referitor la)\s+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -27,6 +34,7 @@ class RoutingInput:
     input_chars: int
     routing_text_chars: int
     chunks_used: int
+    routing_units: list[str]
 
 
 def prepare_routing_input(text: str, mode: str = "auto") -> RoutingInput:
@@ -42,6 +50,7 @@ def prepare_routing_input(text: str, mode: str = "auto") -> RoutingInput:
             input_chars=input_chars,
             routing_text_chars=len(text),
             chunks_used=1 if text else 0,
+            routing_units=semantic_routing_units(text),
         )
 
     digest, chunks_used = build_digest(text)
@@ -52,6 +61,7 @@ def prepare_routing_input(text: str, mode: str = "auto") -> RoutingInput:
         input_chars=input_chars,
         routing_text_chars=len(digest),
         chunks_used=chunks_used,
+        routing_units=semantic_routing_units(digest),
     )
 
 
@@ -79,7 +89,38 @@ def prepare_routing_input_from_path(path: str | Path, mode: str = "auto") -> Rou
         input_chars=input_chars,
         routing_text_chars=len(digest),
         chunks_used=chunks_used,
+        routing_units=semantic_routing_units(digest),
     )
+
+
+def semantic_routing_units(text: str) -> list[str]:
+    """Return one global text plus a bounded set of domain-neutral clauses."""
+    global_text = compact_whitespace(text)
+    if not global_text:
+        return []
+    candidates: list[str] = []
+    for part in SEMANTIC_BOUNDARY_PATTERN.split(text):
+        clean = compact_whitespace(part)
+        if len(clean) < SEMANTIC_MIN_CHARS or clean == global_text:
+            continue
+        if len(clean) > SEMANTIC_MAX_UNIT_CHARS:
+            for start in range(0, len(clean), SEMANTIC_MAX_UNIT_CHARS):
+                piece = clean[start : start + SEMANTIC_MAX_UNIT_CHARS].strip()
+                if len(piece) >= SEMANTIC_MIN_CHARS:
+                    candidates.append(piece)
+        else:
+            candidates.append(clean)
+    units = [global_text]
+    seen = {global_text.casefold()}
+    for candidate in candidates:
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        units.append(candidate)
+        if len(units) >= SEMANTIC_MAX_UNITS:
+            break
+    return units
 
 
 def build_digest(text: str) -> tuple[str, int]:

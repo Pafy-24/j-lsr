@@ -73,3 +73,25 @@ def embed_texts(model: Any, texts: list[str]) -> Any:
 
 def load_model(model_name: str, pu_index: int | None = None, online: bool = False) -> Any:
     return EmbeddingService(model_name, pu_index, online).model
+
+
+def model_tensor_bytes_by_device(model: Any) -> dict[str, int]:
+    """Count owned model parameters/buffers by their actual tensor device."""
+    totals: dict[str, int] = {}
+    seen: set[int] = set()
+    for accessor in ("parameters", "buffers"):
+        values = getattr(model, accessor, None)
+        if not callable(values):
+            continue
+        for tensor in values():
+            identity = id(tensor)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                size = int(tensor.nelement()) * int(tensor.element_size())
+                device = str(getattr(tensor, "device", "cpu"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            totals[device] = totals.get(device, 0) + size
+    return totals

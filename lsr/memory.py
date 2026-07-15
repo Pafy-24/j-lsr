@@ -4,6 +4,8 @@ import ctypes
 import gc
 import os
 import sys
+from collections.abc import Mapping
+from typing import Any
 
 
 def current_process_ram_bytes() -> int:
@@ -13,6 +15,18 @@ def current_process_ram_bytes() -> int:
 
 
 def current_process_ram_bytes_windows() -> int:
+    counters = process_memory_counters_windows()
+    return int(counters.WorkingSetSize) if counters is not None else 0
+
+
+def current_process_private_bytes() -> int:
+    if os.name != "nt":
+        return current_process_ram_bytes()
+    counters = process_memory_counters_windows()
+    return int(counters.PrivateUsage) if counters is not None else 0
+
+
+def process_memory_counters_windows() -> Any:
     from ctypes import wintypes
 
     class ProcessMemoryCounters(ctypes.Structure):
@@ -27,6 +41,7 @@ def current_process_ram_bytes_windows() -> int:
             ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
             ("PagefileUsage", ctypes.c_size_t),
             ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
         ]
 
     counters = ProcessMemoryCounters()
@@ -45,8 +60,8 @@ def current_process_ram_bytes_windows() -> int:
         ]
         function.restype = wintypes.BOOL
         if function(handle, ctypes.byref(counters), counters.cb):
-            return int(counters.WorkingSetSize)
-    return 0
+            return counters
+    return None
 
 
 def current_process_ram_bytes_posix() -> int:
@@ -61,6 +76,7 @@ def current_process_ram_bytes_posix() -> int:
 
 
 def current_vram_bytes() -> int:
+    """CUDA memory reserved by this process (allocated is included in it)."""
     try:
         torch = sys.modules.get("torch")
         if torch is None:
@@ -70,15 +86,67 @@ def current_vram_bytes() -> int:
             return 0
         total = 0
         for index in range(torch.cuda.device_count()):
-            total += int(torch.cuda.memory_allocated(index))
             total += int(torch.cuda.memory_reserved(index))
         return total
     except Exception:
         return 0
 
 
+def cuda_memory_by_device() -> list[dict[str, int | str]]:
+    """Return non-overlapping CUDA allocator counters for every device."""
+    try:
+        torch = sys.modules.get("torch")
+        if torch is None or not torch.cuda.is_available():
+            return []
+        result: list[dict[str, int | str]] = []
+        for index in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(index)
+            allocated = int(torch.cuda.memory_allocated(index))
+            reserved = int(torch.cuda.memory_reserved(index))
+            result.append(
+                {
+                    "index": index,
+                    "name": str(torch.cuda.get_device_name(index)),
+                    "allocated": allocated,
+                    "reserved": reserved,
+                    "cache": max(0, reserved - allocated),
+                    "deviceUsed": int(total - free),
+                    "deviceTotal": int(total),
+                }
+            )
+        return result
+    except Exception:
+        return []
+
+
 def current_footprint_bytes() -> int:
     return current_process_ram_bytes() + current_vram_bytes()
+
+
+def estimate_object_bytes(value: object, seen: set[int] | None = None) -> int:
+    """Best-effort owned Python/NumPy size, excluding callables and modules."""
+    if value is None or callable(value):
+        return 0
+    active_seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in active_seen:
+        return 0
+    active_seen.add(identity)
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, int):
+        return int(nbytes)
+    size = sys.getsizeof(value, 0)
+    if isinstance(value, Mapping):
+        return size + sum(
+            estimate_object_bytes(key, active_seen) + estimate_object_bytes(item, active_seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return size + sum(estimate_object_bytes(item, active_seen) for item in value)
+    namespace = getattr(value, "__dict__", None)
+    if isinstance(namespace, dict):
+        return size + estimate_object_bytes(namespace, active_seen)
+    return size
 
 
 def release_unused_memory() -> None:

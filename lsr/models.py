@@ -71,6 +71,24 @@ class LayeredSignature:
         vector_count = int(self.layer_sizes.get(level, 0))
         return vector_count * int(self.dimension) * 4
 
+    def routing_copy(self) -> LayeredSignature:
+        """Create request-local layer storage over immutable signature metadata."""
+        return LayeredSignature(
+            facet=self.facet,
+            dimension=self.dimension,
+            # Eager/test signatures are immutable and can share their layers.
+            # Lazy production signatures get an independent layer cache so
+            # concurrent routes cannot release another request's vectors.
+            layers=dict(self.layers) if self.layer_loader is None else {},
+            model_name=self.model_name,
+            model_hash=self.model_hash,
+            normalize=self.normalize,
+            distance_metric=self.distance_metric,
+            layer_sizes=dict(self.layer_sizes),
+            layer_byte_sizes=dict(self.layer_byte_sizes),
+            layer_loader=self.layer_loader,
+        )
+
 
 @dataclass
 class ProcessingUnit:

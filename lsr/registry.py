@@ -32,11 +32,13 @@ class SignatureRegistry:
         self.files: dict[str, Path] = {}
         self.file_stats: dict[str, tuple[float, int]] = {}
         self.stale_signatures: list[str] = []
+        self.disabled_facets: set[str] = set()
 
     def load(self, required: bool = True) -> dict[str, LayeredSignature]:
         self.signatures.clear()
         self.files.clear()
         self.file_stats.clear()
+        self.disabled_facets.clear()
         for file_path in self.signature_files(required):
             self.load_file(file_path)
         return self.signatures
@@ -61,17 +63,22 @@ class SignatureRegistry:
                 changed = True
 
         for resolved_path, file_path in current_files.items():
-            if resolved_path not in known_paths:
+            if (
+                resolved_path not in known_paths
+                and file_path.stem.lower() not in self.disabled_facets
+            ):
                 self.load_file(file_path)
                 changed = True
 
         return changed
 
-    def unload(self, facet: str) -> None:
+    def unload(self, facet: str, disable: bool = False) -> None:
         key = facet.strip().lower()
         self.signatures.pop(key, None)
         self.files.pop(key, None)
         self.file_stats.pop(key, None)
+        if disable:
+            self.disabled_facets.add(key)
 
     def load_file(self, file_path: Path) -> LayeredSignature:
         signature = self.codec.load(file_path)
@@ -79,6 +86,7 @@ class SignatureRegistry:
         self.signatures[signature.facet] = signature
         self.files[signature.facet] = file_path
         self.file_stats[signature.facet] = (stat.st_mtime, stat.st_size)
+        self.disabled_facets.discard(signature.facet)
         return signature
 
     def signature_files(self, required: bool) -> list[Path]:

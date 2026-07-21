@@ -10,7 +10,7 @@ from typing import Any, BinaryIO
 from .config import LAYER_FANOUT, SIGNATURE_VERSION, TOP_LAYER_CENTROIDS
 from .dependencies import ensure_numpy, get_kmeans_class
 from .der import DerReader, der_integer, der_octet_string, der_sequence
-from .embedding import embed_texts, normalize_matrix
+from .embedding import embed_texts, normalize_matrix, normalize_matrix_inplace
 from .errors import RouterError
 from .models import FacetSignature, LayeredSignature, RouteExample, SignatureLayer
 
@@ -388,8 +388,11 @@ def octets_to_matrix(payload: bytes, dimension: int) -> Any:
     row_size = dimension * item_size
     if len(payload) % row_size != 0:
         raise RouterError("Vector byte payload is not divisible by signature dimension.")
-    matrix = np.frombuffer(payload, dtype="<f4").reshape((-1, dimension)).astype(np.float32)
-    return normalize_matrix(matrix)
+    raw_matrix = np.frombuffer(payload, dtype="<f4").reshape((-1, dimension))
+    # The byte buffer is immutable. Make exactly one native, writable copy and
+    # normalize it in place to avoid another full-size allocation per layer.
+    matrix = np.array(raw_matrix, dtype=np.float32, order="C", copy=True)
+    return normalize_matrix_inplace(matrix)
 
 
 def encode_links(links: list[list[int]]) -> bytes:

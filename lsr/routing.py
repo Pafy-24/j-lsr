@@ -16,11 +16,6 @@ from .config import (
     SCORING_ANCHOR_WEIGHT,
     SCORING_TOP_AVERAGE_WEIGHT,
     SCORING_LAYER_WEIGHT,
-    SEPARATION_ENABLED,
-    SEPARATION_MIN_TOP_DELTA,
-    SEPARATION_RATIO_THRESHOLD,
-    SEPARATION_PENALTY,
-    SEPARATION_REFUSE_DELTA,
     all_layer_thresholds,
     layer_thresholds,
 )
@@ -30,7 +25,11 @@ from .indexes import build_index
 from .memory import current_footprint_bytes, format_bytes
 from .models import LayeredSignature
 from .routing_policy import child_ids, top_indices
-from .scoring import confidence_from_score, weighted_layer_score
+from .scoring import confidence_from_score, facet_weight_from_score, weighted_layer_score
+
+
+ROUTE_SCHEMA_VERSION = "lsr-route-v2"
+FACET_WEIGHT_SEMANTICS = "independent-pass-to-max-v1"
 
 
 class LSRRouter:
@@ -61,12 +60,11 @@ class LSRRouter:
         self.descend_threshold = None if descend_threshold is None else float(descend_threshold)
         self.accept_threshold = None if accept_threshold is None else float(accept_threshold)
         self.full_depth = full_depth
-        self.cache_policy = cache_policy
+        # Streaming currently releases every lazy layer after use. Keep the
+        # public field for compatibility, but report the policy actually used.
+        self.cache_policy = "release_after_layer"
         self.status_callback = status_callback
         self.memory_callback = memory_callback
-        self.layer_indexes: dict[tuple[str, int], Any] = {}
-        self.global_l1_entries: list[tuple[str, int]] = []
-        self.global_l1_index: Any = None
         self.index_backends: set[str] = set()
         self.last_l1_scanned = 0
         self._reset_memory_metrics()
@@ -79,15 +77,21 @@ class LSRRouter:
         top_k: int | None = None,
         full_depth: bool | None = None,
     ) -> dict[str, Any]:
-        original_full_depth = self.full_depth
-        if full_depth is not None:
-            self.full_depth = bool(full_depth)
-        try:
-            return self._route(prompt, prompt_embedding, self.top_k if top_k is None else int(top_k))
-        finally:
-            self.full_depth = original_full_depth
+        active_full_depth = self.full_depth if full_depth is None else bool(full_depth)
+        return self._route(
+            prompt,
+            prompt_embedding,
+            self.top_k if top_k is None else int(top_k),
+            active_full_depth,
+        )
 
-    def _route(self, prompt: str, prompt_embedding: Any, display_limit: int) -> dict[str, Any]:
+    def _route(
+        self,
+        prompt: str,
+        prompt_embedding: Any,
+        display_limit: int,
+        full_depth: bool,
+    ) -> dict[str, Any]:
         self._reset_memory_metrics()
         coarse_results = self.global_l1_search(prompt_embedding)
 
@@ -96,10 +100,14 @@ class LSRRouter:
         for facet, signature in self.signatures.items():
             result = dict(coarse_by_facet[facet])
             decision = str(result.get("decision", "refused"))
-            if decision == "passed" or self.full_depth:
+            if decision == "passed" or full_depth:
                 results.append(
                     self.search_signature(
-                        signature, prompt, prompt_embedding, coarse_result=result
+                        signature,
+                        prompt,
+                        prompt_embedding,
+                        coarse_result=result,
+                        full_depth=full_depth,
                     )
                 )
             else:
@@ -116,8 +124,18 @@ class LSRRouter:
 
         for result in results:
             self.apply_confidence_decay(result)
+            self.apply_facet_weight(result)
         self.apply_separation(results)
         results.sort(key=lambda item: item["score"], reverse=True)
+        selected_facets = [
+            {
+                "facet": str(result["facet"]),
+                "weight": float(result["weight"]),
+                "decision": str(result["decision"]),
+            }
+            for result in results
+            if str(result.get("decision", "refused")) != "refused"
+        ][:display_limit]
         global_l1_scanned = self.last_l1_scanned
         deep_scanned = sum(
             int(result.get("vectors_scanned", 0))
@@ -125,6 +143,7 @@ class LSRRouter:
             if not str(result.get("mode", "")).lower().startswith(("global l1", "chunked l1", "l1 "))
         )
         route = {
+            "schemaVersion": ROUTE_SCHEMA_VERSION,
             "input": prompt,
             "results": results[:display_limit],
             "compared_facets": len(results),
@@ -137,9 +156,11 @@ class LSRRouter:
             "indexBackend": self.index_backend_label(),
             "vectorsScanned": global_l1_scanned + deep_scanned,
             "activeFacets": self.facets_by_decision(results),
+            "selectedFacets": selected_facets,
+            "weightSemantics": FACET_WEIGHT_SEMANTICS,
             "loadingPolicy": self.loading_policy_label(),
             "thresholds": self.thresholds_label(),
-            "fullDepth": self.full_depth,
+            "fullDepth": full_depth,
             "queryUnits": int(prompt_embedding.shape[0])
             if getattr(prompt_embedding, "ndim", 1) > 1
             else 1,
@@ -152,9 +173,6 @@ class LSRRouter:
         return route
 
     def build_indexes(self) -> None:
-        self.layer_indexes.clear()
-        self.global_l1_entries.clear()
-        self.global_l1_index = None
         self.index_backends.clear()
         self.index_backends.add("streaming-flat")
 
@@ -169,7 +187,7 @@ class LSRRouter:
         return f"streaming-release-layer:{self.memory_limit_mb:g}MB-total"
 
     def cache_policy_label(self) -> str:
-        return "release_after_layer"
+        return self.cache_policy
 
     def thresholds_for(self, level: int) -> dict[str, float]:
         thresholds = layer_thresholds(level)
@@ -397,12 +415,23 @@ class LSRRouter:
         result["score"] = float(result["semanticScore"])
         return result
 
+    def apply_facet_weight(self, result: dict[str, Any]) -> None:
+        """Attach the downstream multi-label weight without cross-facet normalization."""
+        last_layer = result.get("layers", [{}])[-1]
+        result["weight"] = facet_weight_from_score(
+            float(result.get("score", 0.0)),
+            float(last_layer.get("passThreshold", 0.0)),
+            str(result.get("decision", "refused")),
+        )
+
     def apply_separation(self, results: list[dict[str, Any]]) -> None:
         if not results:
             return
-        ordered = sorted(results, key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        top_score = max(float(ordered[0].get("score", 0.0)), 1e-9)
-        for rank, result in enumerate(ordered):
+        top_score = max(
+            max(float(result.get("score", 0.0)) for result in results),
+            1e-9,
+        )
+        for result in results:
             score = float(result.get("score", 0.0))
             delta = max(0.0, top_score - score)
             ratio = score / top_score if top_score > 0 else 0.0
@@ -514,8 +543,10 @@ class LSRRouter:
         prompt: str,
         prompt_embedding: Any,
         coarse_result: dict[str, Any] | None = None,
+        full_depth: bool | None = None,
     ) -> dict[str, Any]:
         np = ensure_numpy()
+        active_full_depth = self.full_depth if full_depth is None else bool(full_depth)
         levels = signature.levels()
         last_level = levels[-1]
 
@@ -563,11 +594,13 @@ class LSRRouter:
             layer = self.load_layer(signature, level)
             try:
                 if candidate_ids is None:
-                    source_ids = list(range(len(layer.vectors)))
                     limit = SEARCH_L1_TOP if position == 0 else SEARCH_NEXT_TOP
-                    top_local, top_scores = self.search_layer(layer.vectors, prompt_embedding, limit, level)
+                    top_local, top_scores = self.search_layer(
+                        layer.vectors, prompt_embedding, limit, level
+                    )
                     top_source_ids = [int(index) for index in top_local]
                     vectors_scanned += len(layer.vectors)
+                    source_count = len(layer.vectors)
                 else:
                     source_ids = candidate_ids
                     self.ensure_memory_available(
@@ -580,6 +613,7 @@ class LSRRouter:
                     top_scores = [float(scores[index]) for index in top_local]
                     top_source_ids = [int(source_ids[index]) for index in top_local]
                     vectors_scanned += len(candidate_ids)
+                    source_count = len(source_ids)
                 if len(top_local):
                     best_cluster_score = float(top_scores[0])
 
@@ -589,11 +623,11 @@ class LSRRouter:
                     best_cluster_score,
                     vector_index,
                     vectors_scanned,
-                    len(source_ids),
+                    source_count,
                 )
                 traces.append(trace)
 
-                if trace["decision"] == "accepted" and not self.full_depth:
+                if trace["decision"] == "accepted" and not active_full_depth:
                     result = {
                         "facet": signature.facet,
                         "score": best_cluster_score,
@@ -613,7 +647,7 @@ class LSRRouter:
                         best_cluster_score,
                     )
 
-                if trace["decision"] == "refused" and not self.full_depth:
+                if trace["decision"] == "refused" and not active_full_depth:
                     result = {
                         "facet": signature.facet,
                         "score": best_cluster_score,
@@ -815,6 +849,7 @@ def confidence_entropy(score: float) -> float:
 
 def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
     return {
+        "schemaVersion": route.get("schemaVersion", ROUTE_SCHEMA_VERSION),
         "input": route["input"],
         "compared_facets": route["compared_facets"],
         "deep_facets": route["deep_facets"],
@@ -823,6 +858,8 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
         "vectorsScanned": route.get("vectorsScanned", 0),
         "similarityEvaluationsUpperBound": route.get("similarityEvaluationsUpperBound", 0),
         "activeFacets": route.get("activeFacets", {}),
+        "selectedFacets": route.get("selectedFacets", []),
+        "weightSemantics": route.get("weightSemantics", FACET_WEIGHT_SEMANTICS),
         "loadingPolicy": route.get("loadingPolicy", ""),
         "thresholds": route.get("thresholds", {}),
         "fullDepth": route.get("fullDepth", False),
@@ -848,6 +885,7 @@ def json_ready_route(route: dict[str, Any]) -> dict[str, Any]:
                 "decision": result.get("decision", ""),
                 "semanticScore": result.get("semanticScore", result["score"]),
                 "confidence": result.get("confidence", 0.0),
+                "weight": result.get("weight", 0.0),
                 "separation": result.get("separation", 0.0),
                 "separationRatio": result.get("separationRatio", 0.0),
                 "anchorSimilarity": result.get("anchorSimilarity", 0.0),

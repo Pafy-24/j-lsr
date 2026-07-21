@@ -80,6 +80,33 @@ class SemanticScoringTests(unittest.TestCase):
         self.assertEqual(route["signatureMemory"]["byLevel"]["1"]["loads"], 2)
         self.assertEqual(route["signatureMemory"]["residentVectorBytesAfterRank"], 0)
 
+    def test_selected_facets_have_independent_fractional_weights(self) -> None:
+        query = np.asarray([1.0, 0.0], dtype=np.float32)
+        signatures = {
+            "crypto": self._signature("crypto", [[0.90, 0.10], [0.86, 0.14]]),
+            "web": self._signature("web", [[0.88, 0.12], [0.84, 0.16]]),
+        }
+
+        route = LSRRouter(signatures, top_k=2).route("mixed", query)
+        weights = [item["weight"] for item in route["selectedFacets"]]
+
+        self.assertEqual(route["schemaVersion"], "lsr-route-v2")
+        self.assertEqual(route["weightSemantics"], "independent-pass-to-max-v1")
+        self.assertEqual({item["facet"] for item in route["selectedFacets"]}, {"crypto", "web"})
+        self.assertTrue(all(0.0 < weight < 1.0 for weight in weights))
+        self.assertGreater(sum(weights), 1.0)
+        self.assertTrue(all(0.0 <= result["weight"] <= 1.0 for result in route["results"]))
+
+    def test_all_refused_facets_produce_an_empty_selection(self) -> None:
+        route = LSRRouter(
+            {"crypto": self._signature("crypto", [[1.0, 0.0], [0.9, 0.1]])},
+            top_k=1,
+        ).route("unrelated", np.asarray([-1.0, 0.0], dtype=np.float32))
+
+        self.assertEqual(route["selectedFacets"], [])
+        self.assertEqual(route["results"][0]["decision"], "refused")
+        self.assertEqual(route["results"][0]["weight"], 0.0)
+
     def test_vector_memory_is_registered_and_released(self) -> None:
         events: list[tuple[object, ...]] = []
         signature = self._signature("crypto", [[0.90, 0.10], [0.85, 0.15]])

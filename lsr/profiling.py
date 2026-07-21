@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Any
 
-from .memory import cuda_memory_by_device, current_process_private_bytes, current_process_ram_bytes
+from .memory import cuda_memory_by_device, current_process_memory_bytes
 
 
 class RankProfiler:
@@ -25,9 +25,8 @@ class RankProfiler:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self.ram_before = current_process_ram_bytes()
+        self.ram_before, self.private_before = current_process_memory_bytes()
         self.ram_peak = self.ram_before
-        self.private_before = current_process_private_bytes()
         self.private_peak = self.private_before
         self.vram_before = cuda_memory_by_device()
         self._reset_cuda_peaks()
@@ -45,8 +44,7 @@ class RankProfiler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.05)
-        ram_after = current_process_ram_bytes()
-        private_after = current_process_private_bytes()
+        ram_after, private_after = current_process_memory_bytes()
         self.ram_peak = max(self.ram_peak, ram_after)
         self.private_peak = max(self.private_peak, private_after)
         cuda = self._cuda_result()
@@ -72,8 +70,9 @@ class RankProfiler:
 
     def _sample_ram(self) -> None:
         while not self._stop.wait(self.sample_interval):
-            self.ram_peak = max(self.ram_peak, current_process_ram_bytes())
-            self.private_peak = max(self.private_peak, current_process_private_bytes())
+            ram, private = current_process_memory_bytes()
+            self.ram_peak = max(self.ram_peak, ram)
+            self.private_peak = max(self.private_peak, private)
 
     @staticmethod
     def _reset_cuda_peaks() -> None:

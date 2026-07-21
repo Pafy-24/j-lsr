@@ -30,6 +30,20 @@ DEFAULT_BENCHMARK_DATASET = str(get_config_value(CONFIG, "paths.benchmark_datase
 DEFAULT_SERVER_HOST = str(get_config_value(CONFIG, "server.host"))
 DEFAULT_SERVER_PORT = int(get_config_value(CONFIG, "server.port"))
 DEFAULT_SERVER_URL = str(get_config_value(CONFIG, "server.url"))
+DEFAULT_SERVER_MAX_REQUEST_BYTES = int(get_config_value(CONFIG, "server.max_request_bytes"))
+DEFAULT_SERVER_MAX_BATCH_SIZE = int(get_config_value(CONFIG, "server.max_batch_size"))
+DEFAULT_SERVER_MAX_PENDING_REQUESTS = int(
+    get_config_value(CONFIG, "server.max_pending_requests")
+)
+DEFAULT_SIGNATURE_REFRESH_INTERVAL_SECONDS = float(
+    get_config_value(CONFIG, "server.signature_refresh_interval_seconds")
+)
+DEFAULT_EMBEDDING_BATCH_MAX_UNITS = int(
+    get_config_value(CONFIG, "server.embedding_batch_max_units")
+)
+DEFAULT_EMBEDDING_BATCH_WAIT_MS = float(
+    get_config_value(CONFIG, "server.embedding_batch_wait_ms")
+)
 
 DEFAULT_MAX_VECTORS = int(get_config_value(CONFIG, "signature.max_vectors"))
 SIGNATURE_VERSION = int(get_config_value(CONFIG, "signature.version"))

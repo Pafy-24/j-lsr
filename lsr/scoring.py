@@ -104,3 +104,18 @@ def confidence_from_score(score: float, pass_threshold: float, accept_threshold:
     if accept_threshold <= pass_threshold:
         return 1.0 if score >= accept_threshold else 0.0
     return max(0.0, min(1.0, (score - pass_threshold) / (accept_threshold - pass_threshold)))
+
+
+def facet_weight_from_score(score: float, pass_threshold: float, decision: str) -> float:
+    """Return an independent multi-label activation weight in ``[0, 1]``.
+
+    The weight is intentionally not normalized across facets: two relevant
+    facets may both receive strong weights.  Crossing the accept threshold
+    also does not force the weight to 1; full activation is reserved for the
+    maximum cosine score.
+    """
+    if decision == "refused" or score <= pass_threshold:
+        return 0.0
+    if pass_threshold >= 1.0:
+        return 1.0
+    return max(0.0, min(1.0, (score - pass_threshold) / (1.0 - pass_threshold)))

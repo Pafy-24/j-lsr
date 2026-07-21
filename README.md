@@ -213,9 +213,38 @@ Default config shape:
 }
 ```
 
-Routing depth is no longer decided by top-k or a fixed number of accepted facets. `--top-k` only limits how many sorted results are returned after all threshold decisions have been evaluated.
+Routing depth is no longer decided by top-k or a fixed number of accepted
+facets. `--top-k` only limits the returned diagnostic results and selected
+facets after all threshold decisions have been evaluated.
 
-For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON output includes each layer score, threshold, decision, confidence decay, entropy, plus facet-level `semanticScore`, `confidence`, `separation`, `anchorSimilarity`, `lexicalScore`, `genericPenalty`, and `repetitionPenalty`.
+For diagnostics, `router.py rank --full-depth ...` evaluates all layers even when an earlier layer already returned `accepted` or `refused`. JSON output includes each layer score, threshold, decision, confidence decay, entropy, plus facet-level `semanticScore`, `confidence`, `weight`, `separation`, `anchorSimilarity`, `lexicalScore`, `genericPenalty`, and `repetitionPenalty`.
+
+Routing is multi-label. The machine-readable response exposes `selectedFacets`,
+an independently weighted list of every non-refused facet up to `top_k`:
+
+```json
+{
+  "schemaVersion": "lsr-route-v2",
+  "weightSemantics": "independent-pass-to-max-v1",
+  "selectedFacets": [
+    {"facet": "web", "weight": 0.61, "decision": "passed"},
+    {"facet": "crypto", "weight": 0.43, "decision": "passed"}
+  ]
+}
+```
+
+`weight` is always in `[0, 1]`, is not normalized across facets, and is not a
+probability. Passing the `accepted` threshold does not force a weight of `1`;
+that value is reserved for the maximum semantic score. Downstream inference
+can therefore apply a facet gradually instead of allowing a weakly relevant
+facet to dominate the base model. If every facet is refused, `selectedFacets`
+is an empty list. No synthetic `unknown` route is emitted. The full `results`
+list remains available for diagnostics and includes refused facets with
+`weight: 0`.
+
+`schemaVersion` and `weightSemantics` make this contract explicit for Mixed
+Inference and allow the weighting formula to evolve later without silently
+changing downstream behavior.
 
 Inside a selected faucet, the router expands the best linked clusters until the anchor layer, then performs exact search only on the selected anchor pool.
 
@@ -328,6 +357,25 @@ Supported endpoints:
 - `POST /loadsig` - accepts `{"signatures": "path/to/file-or-directory"}`
 - `POST /unloadsig` - accepts `{"facet": "crypto"}`, `{"facets": ["crypto"]}`, or `{"all": true}`
 
+Explicitly unloaded facets remain disabled during automatic signature refresh.
+Calling `loadsig` creates a fresh registry and enables the signatures found at
+the requested path again.
+
+The server applies resource backpressure: JSON requests are limited to 4 MiB,
+batches to 256 prompts, and the worker pool accepts at most eight queued
+requests beyond the active workers. Signature directory scans are throttled to
+once per second; explicit `loadsig` and `unloadsig` operations remain immediate.
+
+Concurrent rank requests are not serialized by a global request lock. Each
+request routes against an atomic metadata snapshot and owns its lazy layer
+cache, so one request cannot release another request's vectors. Embedding
+requests are sent through one micro-batching worker. By default it waits up to
+5 ms and combines up to 256 semantic units into one model invocation. Existing
+`/batch` requests and simultaneous `/rank` calls share the same batching path.
+`GET /health` exposes cumulative batching counters under `embeddingBatcher`.
+Signature load/unload/refresh operations use a short state lock while active
+routes continue safely on their existing snapshots.
+
 Before each rank request, the server refreshes the signature registry. Deleted `.sig` files are unloaded, modified files are reloaded, and new `.sig` files are loaded automatically when the active signature path is a directory.
 
 Signature loading can be controlled through CLI commands while the server is running:
@@ -387,7 +435,11 @@ Rank | Facet  | Score  | Best Vector | Cluster | Exact | Mode | Best Match
 1    | crypto | 0.6042 | 0.6276      | 0.6029  | 23    | deep | vector #671
 ```
 
-With only one faucet signature, every prompt returns `crypto`; the score is semantic similarity, not a calibrated probability. Add more faucet `.sig` files to compare facets directly. The `Exact` column shows how many layer-3 vectors were actually scanned after hierarchical pruning.
+With only one faucet signature, the diagnostic `results` list compares against
+`crypto`, but `selectedFacets` remains empty when that signature is refused.
+The score and weight are not calibrated probabilities. Add more faucet `.sig`
+files to compare facets directly. The `Exact` column shows how many final-layer
+vectors were scanned after hierarchical pruning.
 
 ## Dataset Format
 
@@ -503,7 +555,12 @@ python router.py evaluate `
   --output sweep-report.json
 ```
 
-The report includes recall@1, recall@3, MRR, false-positive rate, refused rate, per-layer accepted/passed/refused counts, confidence/separation/decay stats, lexical/generic/repetition diagnostics, latency p50/p95/p99, process RAM/VRAM footprint, and loaded vector bytes.
+The report includes recall@1, recall@3, MRR, false-positive rate, refused rate,
+per-layer accepted/passed/refused counts, selected-facet count, weight,
+confidence/separation/decay stats, lexical/generic/repetition diagnostics,
+latency p50/p95/p99, process RAM/VRAM footprint, and loaded vector bytes.
+Recall and false-positive metrics use `selectedFacets`, so refused diagnostic
+results cannot be counted as successful routing decisions.
 
 ## Other Supported Dataset Shapes
 

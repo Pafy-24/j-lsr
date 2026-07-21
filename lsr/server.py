@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,8 +9,17 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
+from .config import (
+    DEFAULT_CACHE_POLICY,
+    DEFAULT_EMBEDDING_BATCH_MAX_UNITS,
+    DEFAULT_EMBEDDING_BATCH_WAIT_MS,
+    DEFAULT_SERVER_MAX_BATCH_SIZE,
+    DEFAULT_SERVER_MAX_PENDING_REQUESTS,
+    DEFAULT_SERVER_MAX_REQUEST_BYTES,
+    DEFAULT_SIGNATURE_REFRESH_INTERVAL_SECONDS,
+)
 from .console import console
-from .embedding import embed_texts, load_model, model_tensor_bytes_by_device
+from .embedding import EmbeddingBatcher, load_model, model_tensor_bytes_by_device
 from .errors import RouterError
 from .input_digest import prepare_routing_input
 from .memory import current_process_ram_bytes, current_vram_bytes, estimate_object_bytes
@@ -45,7 +55,11 @@ class LSRRouteService:
         self.memory_limit_mb = memory_limit_mb
         self.descend_threshold = descend_threshold
         self.accept_threshold = accept_threshold
-        self.request_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._refresh_lock = threading.Lock()
+        self._route_ids = itertools.count(1)
+        self.signature_refresh_interval_seconds = DEFAULT_SIGNATURE_REFRESH_INTERVAL_SECONDS
+        self._last_signature_refresh = 0.0
         self.registry = SignatureRegistry(signatures_path)
         self.signatures: dict[str, LayeredSignature] = self.registry.signatures
         self.model_name = model_name
@@ -55,6 +69,11 @@ class LSRRouteService:
         validate_signature_model_compatibility(self.model_name, self.signatures)
         ram_before_model = current_process_ram_bytes()
         self.model = load_model(self.model_name, pu_index, online)
+        self.embedding_batcher = EmbeddingBatcher(
+            self.model,
+            max_batch_units=DEFAULT_EMBEDDING_BATCH_MAX_UNITS,
+            max_wait_ms=DEFAULT_EMBEDDING_BATCH_WAIT_MS,
+        )
         model_tensor_bytes = model_tensor_bytes_by_device(self.model)
         ram_after_model = current_process_ram_bytes()
         self.monitor: ServerMonitor | None = None
@@ -92,19 +111,52 @@ class LSRRouteService:
                 )
         self.router = self.build_router(default_top_k)
 
-    def build_router(self, top_k: int) -> LSRRouter:
+    def build_router(
+        self,
+        top_k: int,
+        signatures: dict[str, LayeredSignature] | None = None,
+        memory_callback: Any = None,
+    ) -> LSRRouter:
         return LSRRouter(
-            self.signatures,
+            self.signatures if signatures is None else signatures,
             top_k,
             index_policy=self.index_policy,
             model_name=self.model_name,
             memory_limit_mb=self.memory_limit_mb,
             descend_threshold=self.descend_threshold,
             accept_threshold=self.accept_threshold,
-            cache_policy="release_after_layer",
+            cache_policy=DEFAULT_CACHE_POLICY,
             status_callback=self._status,
-            memory_callback=self._memory_event,
+            memory_callback=self._memory_event if memory_callback is None else memory_callback,
         )
+
+    def routing_router(self, top_k: int) -> LSRRouter:
+        """Build a request-local router from an atomic signature snapshot."""
+        with self._state_lock:
+            signatures = {
+                facet: signature.routing_copy()
+                for facet, signature in self.signatures.items()
+            }
+        if not signatures:
+            raise RouterError("No signatures loaded. Use loadsig first.")
+        route_id = next(self._route_ids)
+
+        def memory_event(
+            action: str,
+            memory: str,
+            name: str,
+            size: int,
+            location: str,
+        ) -> None:
+            self._memory_event(
+                action,
+                memory,
+                f"route-{route_id}:{name}",
+                size,
+                location,
+            )
+
+        return self.build_router(top_k, signatures, memory_callback=memory_event)
 
     def _status(self, operation: str, detail: str = "") -> None:
         if self.monitor is not None:
@@ -134,28 +186,39 @@ class LSRRouteService:
             )
 
     def health(self) -> dict[str, Any]:
+        with self._state_lock:
+            router = self.router
+            signatures = dict(self.signatures)
+            signatures_path = self.signatures_path
+            loaded_layers = self.registry.loaded_layers()
+            loaded_vector_bytes = self.registry.loaded_vector_bytes()
+            signature_files = self.registry.signature_files_payload()
+            stale_signatures = list(self.registry.stale_signatures)
+            disabled_facets = sorted(self.registry.disabled_facets)
         return {
             "status": "ok",
             "service": "LSR",
             "model": self.model_name,
             "requested_model": self.requested_model_name,
             "index_policy": self.index_policy,
-            "index_backend": self.router.index_backend_label(),
-            "loading_policy": self.router.loading_policy_label(),
+            "index_backend": router.index_backend_label(),
+            "loading_policy": router.loading_policy_label(),
             "memory_limit_mb": self.memory_limit_mb,
             "processRamBytes": current_process_ram_bytes(),
             "processVramBytes": current_vram_bytes(),
-            "thresholds": self.router.thresholds_label(),
-            "cachePolicy": self.router.cache_policy_label(),
-            "loadedLayers": self.registry.loaded_layers(),
-            "loadedVectorBytes": self.registry.loaded_vector_bytes(),
+            "thresholds": router.thresholds_label(),
+            "cachePolicy": router.cache_policy_label(),
+            "embeddingBatcher": self.embedding_batcher.stats(),
+            "loadedLayers": loaded_layers,
+            "loadedVectorBytes": loaded_vector_bytes,
             "memoryComponents": self.monitor.components_payload() if self.monitor is not None else [],
             "memoryStats": self.monitor.memory_stats() if self.monitor is not None else {},
             "lastRankPerformance": self.monitor.last_profile() if self.monitor is not None else {},
-            "signatureFiles": self.registry.signature_files_payload(),
-            "staleSignatures": self.registry.stale_signatures,
-            "signatures": self.signatures_path,
-            "facets": sorted(self.signatures),
+            "signatureFiles": signature_files,
+            "staleSignatures": stale_signatures,
+            "disabledFacets": disabled_facets,
+            "signatures": signatures_path,
+            "facets": sorted(signatures),
             "facet_metadata": {
                 facet: {
                     "modelName": signature.model_name,
@@ -164,57 +227,58 @@ class LSRRouteService:
                     "normalize": signature.normalize,
                     "distanceMetric": signature.distance_metric,
                 }
-                for facet, signature in sorted(self.signatures.items())
+                for facet, signature in sorted(signatures.items())
             },
             "default_top_k": self.default_top_k,
         }
 
     def load_signatures(self, path: str, required: bool = True) -> dict[str, Any]:
-        self.registry = SignatureRegistry(path)
-        loaded = self.registry.load(required=required)
-        if getattr(self, "model_name", "auto") != "auto":
-            validate_signature_model_compatibility(self.model_name, loaded)
-        self.signatures = self.registry.signatures
-        self.signatures_path = path
-        if hasattr(self, "router"):
-            self.router = self.build_router(self.default_top_k)
-        self._sync_signature_components()
-        return {
-            "loaded": sorted(loaded),
-            "facets": sorted(self.signatures),
-        }
+        with self._state_lock:
+            registry = SignatureRegistry(path)
+            loaded = registry.load(required=required)
+            if getattr(self, "model_name", "auto") != "auto":
+                validate_signature_model_compatibility(self.model_name, loaded)
+            self.registry = registry
+            self.signatures = registry.signatures
+            self.signatures_path = path
+            if hasattr(self, "router"):
+                self.router = self.build_router(self.default_top_k)
+            self._sync_signature_components()
+            return {
+                "loaded": sorted(loaded),
+                "facets": sorted(self.signatures),
+            }
 
     def unload_signatures(
         self, facets: list[str] | None = None, unload_all: bool = False
     ) -> dict[str, Any]:
-        if unload_all:
-            removed = sorted(self.signatures)
-            self.signatures.clear()
-            self.registry.signatures.clear()
-            self.registry.files.clear()
-            self.registry.file_stats.clear()
+        with self._state_lock:
+            if unload_all:
+                removed = sorted(self.signatures)
+                for facet in removed:
+                    self.registry.unload(facet, disable=True)
+                self.router = self.build_router(self.default_top_k)
+                self._sync_signature_components()
+                return {"unloaded": removed, "facets": []}
+            if not facets:
+                raise RouterError("Provide facets or all=true.")
+
+            removed: list[str] = []
+            missing: list[str] = []
+            for facet in facets:
+                key = facet.strip().lower()
+                if key in self.signatures:
+                    self.registry.unload(key, disable=True)
+                    removed.append(key)
+                else:
+                    missing.append(key)
             self.router = self.build_router(self.default_top_k)
             self._sync_signature_components()
-            return {"unloaded": removed, "facets": []}
-        if not facets:
-            raise RouterError("Provide facets or all=true.")
-
-        removed: list[str] = []
-        missing: list[str] = []
-        for facet in facets:
-            key = facet.strip().lower()
-            if key in self.signatures:
-                self.registry.unload(key)
-                removed.append(key)
-            else:
-                missing.append(key)
-        self.router = self.build_router(self.default_top_k)
-        self._sync_signature_components()
-        return {
-            "unloaded": removed,
-            "missing": missing,
-            "facets": sorted(self.signatures),
-        }
+            return {
+                "unloaded": removed,
+                "missing": missing,
+                "facets": sorted(self.signatures),
+            }
 
     def route_one(
         self,
@@ -229,16 +293,20 @@ class LSRRouteService:
         if not prompt:
             raise RouterError("Missing prompt.")
         self.refresh_signatures()
-        if not self.signatures:
-            raise RouterError("No signatures loaded. Use loadsig first.")
         active_top_k = self._top_k(top_k)
+        router = self.routing_router(active_top_k)
         routing_input = prepare_routing_input(prompt, large_input)
         self._status("embedding", f"1 input on {getattr(self.model, 'device', 'selected PU')}")
         embedding_started = time.perf_counter()
-        prompt_embedding = embed_texts(self.model, routing_input.routing_units)
+        prompt_embedding = self.embedding_batcher.embed(routing_input.routing_units)
         profiler.stage("embedding", embedding_started)
         routing_started = time.perf_counter()
-        route = self.router.route(routing_input.routing_text, prompt_embedding, active_top_k, full_depth=full_depth)
+        route = router.route(
+            routing_input.routing_text,
+            prompt_embedding,
+            active_top_k,
+            full_depth=full_depth,
+        )
         profiler.stage("routing", routing_started)
         attach_input_metadata(route, routing_input)
         response = json_ready_route(route)
@@ -261,22 +329,25 @@ class LSRRouteService:
         cleaned = [prompt.strip() for prompt in prompts]
         if not cleaned:
             raise RouterError("Missing prompts.")
+        if len(cleaned) > DEFAULT_SERVER_MAX_BATCH_SIZE:
+            raise RouterError(
+                f"Batch exceeds the {DEFAULT_SERVER_MAX_BATCH_SIZE}-item limit."
+            )
         self.refresh_signatures()
-        if not self.signatures:
-            raise RouterError("No signatures loaded. Use loadsig first.")
         for index, prompt in enumerate(cleaned, start=1):
             if not prompt:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
+        router = self.routing_router(active_top_k)
         routing_inputs = [prepare_routing_input(prompt, large_input) for prompt in cleaned]
         self._status("embedding", f"batch of {len(routing_inputs)} inputs")
         flat_units = [unit for item in routing_inputs for unit in item.routing_units]
-        embeddings = embed_texts(self.model, flat_units)
+        embeddings = self.embedding_batcher.embed(flat_units)
         routes = []
         offset = 0
         for routing_input in routing_inputs:
             unit_count = len(routing_input.routing_units)
-            route = self.router.route(
+            route = router.route(
                 routing_input.routing_text,
                 embeddings[offset : offset + unit_count],
                 active_top_k,
@@ -295,12 +366,32 @@ class LSRRouteService:
             raise RouterError("top_k must be at least 1.")
         return active_top_k
 
-    def refresh_signatures(self) -> None:
-        if self.registry.refresh():
-            validate_signature_model_compatibility(self.model_name, self.registry.signatures)
-            self.signatures = self.registry.signatures
-            self.router = self.build_router(self.default_top_k)
-            self._sync_signature_components()
+    def refresh_signatures(self, force: bool = False) -> None:
+        if not self._refresh_lock.acquire(blocking=force):
+            return
+        try:
+            with self._state_lock:
+                now = time.monotonic()
+                if (
+                    not force
+                    and now - self._last_signature_refresh
+                    < self.signature_refresh_interval_seconds
+                ):
+                    return
+                self._last_signature_refresh = now
+                if self.registry.refresh():
+                    validate_signature_model_compatibility(
+                        self.model_name,
+                        self.registry.signatures,
+                    )
+                    self.signatures = self.registry.signatures
+                    self.router = self.build_router(self.default_top_k)
+                    self._sync_signature_components()
+        finally:
+            self._refresh_lock.release()
+
+    def close(self) -> None:
+        self.embedding_batcher.close()
 
 
 class LSRHTTPServer(HTTPServer):
@@ -309,10 +400,23 @@ class LSRHTTPServer(HTTPServer):
     def __init__(self, address: tuple[str, int], service: LSRRouteService, workers: int = 4):
         super().__init__(address, LSRRequestHandler)
         self.service = service
-        self.executor = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="lsr-http")
+        active_workers = max(1, workers)
+        self.executor = ThreadPoolExecutor(
+            max_workers=active_workers,
+            thread_name_prefix="lsr-http",
+        )
+        self.request_slots = threading.BoundedSemaphore(
+            active_workers + max(0, DEFAULT_SERVER_MAX_PENDING_REQUESTS)
+        )
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        self.executor.submit(self._process_request, request, client_address)
+        self.request_slots.acquire()
+        try:
+            self.executor.submit(self._process_request, request, client_address)
+        except Exception:
+            self.request_slots.release()
+            self.shutdown_request(request)
+            raise
 
     def _process_request(self, request: Any, client_address: Any) -> None:
         try:
@@ -321,6 +425,7 @@ class LSRHTTPServer(HTTPServer):
             self.handle_error(request, client_address)
         finally:
             self.shutdown_request(request)
+            self.request_slots.release()
 
     def server_close(self) -> None:
         super().server_close()
@@ -339,29 +444,28 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             payload = self._read_json()
-            with self.server.service.request_lock:
-                if self.path in {"/route", "/rank"}:
-                    response = self.server.service.route_one(
-                        extract_prompt(payload),
-                        extract_top_k(payload),
-                        extract_full_depth(payload),
-                        extract_large_input(payload),
-                    )
-                elif self.path == "/batch":
-                    response = self.server.service.route_batch(
-                        extract_prompts(payload),
-                        extract_top_k(payload),
-                        extract_full_depth(payload),
-                        extract_large_input(payload),
-                    )
-                elif self.path == "/loadsig":
-                    response = self.server.service.load_signatures(extract_signature_path(payload))
-                elif self.path == "/unloadsig":
-                    facets, unload_all = extract_unload_request(payload)
-                    response = self.server.service.unload_signatures(facets, unload_all)
-                else:
-                    self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
-                    return
+            if self.path in {"/route", "/rank"}:
+                response = self.server.service.route_one(
+                    extract_prompt(payload),
+                    extract_top_k(payload),
+                    extract_full_depth(payload),
+                    extract_large_input(payload),
+                )
+            elif self.path == "/batch":
+                response = self.server.service.route_batch(
+                    extract_prompts(payload),
+                    extract_top_k(payload),
+                    extract_full_depth(payload),
+                    extract_large_input(payload),
+                )
+            elif self.path == "/loadsig":
+                response = self.server.service.load_signatures(extract_signature_path(payload))
+            elif self.path == "/unloadsig":
+                facets, unload_all = extract_unload_request(payload)
+                response = self.server.service.unload_signatures(facets, unload_all)
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+                return
             self._write_json(HTTPStatus.OK, response)
         except RouterError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -372,11 +476,22 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _read_json(self) -> Any:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_length = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise RouterError("Content-Length must be an integer.") from exc
         if length <= 0:
             raise RouterError("Missing JSON body.")
+        if length > DEFAULT_SERVER_MAX_REQUEST_BYTES:
+            raise RouterError(
+                f"JSON body exceeds the {DEFAULT_SERVER_MAX_REQUEST_BYTES}-byte limit."
+            )
         raw = self.rfile.read(length)
-        return json.loads(raw.decode("utf-8"))
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise RouterError("JSON body must be UTF-8.") from exc
 
     def _write_json(self, status: HTTPStatus, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -407,6 +522,10 @@ def extract_prompts(payload: Any) -> list[str]:
         items = None
     if not isinstance(items, list):
         raise RouterError("Batch body must be a list or include inputs/prompts/texts.")
+    if len(items) > DEFAULT_SERVER_MAX_BATCH_SIZE:
+        raise RouterError(
+            f"Batch exceeds the {DEFAULT_SERVER_MAX_BATCH_SIZE}-item limit."
+        )
     prompts: list[str] = []
     for index, item in enumerate(items, start=1):
         if isinstance(item, str):
@@ -523,3 +642,4 @@ def serve(
         if service.monitor is not None:
             service.monitor.stop()
         server.server_close()
+        service.close()

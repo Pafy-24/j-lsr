@@ -408,6 +408,8 @@ class RouterCLI:
         decays: list[float] = []
         entropies: list[float] = []
         confidences: list[float] = []
+        weights: list[float] = []
+        selected_counts: list[float] = []
         separations: list[float] = []
         separation_ratios: list[float] = []
         lexical_scores: list[float] = []
@@ -429,18 +431,21 @@ class RouterCLI:
             route = router.route(routing_input.routing_text, embedding)
             latencies_ms.append((time.perf_counter() - started) * 1000)
             results = route["results"]
-            facets = [str(result["facet"]).lower() for result in results]
+            selected = route.get("selectedFacets", [])
+            facets = [str(result["facet"]).lower() for result in selected]
+            selected_counts.append(float(len(selected)))
             expected_set = {facet.lower() for facet in expected_facets}
             rank = next((index + 1 for index, facet in enumerate(facets) if facet in expected_set), None)
             ranks.append(rank)
             if facets and facets[0] not in expected_set:
                 false_positives += 1
-            if results and str(results[0].get("decision")) == "refused":
+            if not selected:
                 refused += 1
             for result in results:
                 decays.append(float(result.get("confidence_decay", 0.0)))
                 entropies.append(float(result.get("entropy", 0.0)))
                 confidences.append(float(result.get("confidence", 0.0)))
+                weights.append(float(result.get("weight", 0.0)))
                 separations.append(float(result.get("separation", 0.0)))
                 separation_ratios.append(float(result.get("separationRatio", 0.0)))
                 lexical_scores.append(float(result.get("lexicalScore", 0.0)))
@@ -465,6 +470,8 @@ class RouterCLI:
             "decisionsByLayer": decisions_by_layer,
             "confidenceDecay": metric_summary(decays),
             "confidence": metric_summary(confidences),
+            "weight": metric_summary(weights),
+            "selectedFacetCount": metric_summary(selected_counts),
             "separation": metric_summary(separations),
             "separationRatio": metric_summary(separation_ratios),
             "lexicalScore": metric_summary(lexical_scores),
@@ -506,6 +513,8 @@ def print_signature_summary(signatures: list[FacetSignature]) -> None:
             f"{signature.facet}.sig",
         )
     console.print(table)
+
+
 def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
     top_results = route["results"]
 
@@ -514,6 +523,7 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
     table.add_column("Rank", justify="right")
     table.add_column("Facet")
     table.add_column("Score", justify="right")
+    table.add_column("Weight", justify="right")
     table.add_column("Decision")
     table.add_column("Exact", justify="right")
     table.add_column("Layers")
@@ -522,6 +532,7 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
             str(rank),
             result["facet"],
             f"{result['score']:.4f}",
+            f"{float(result.get('weight', 0.0)):.4f}",
             str(result.get("decision", "")),
             str(result["exact_count"]),
             format_layer_trace(result.get("layers", [])),
@@ -569,7 +580,6 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
     if args.debug:
         prompt = route["input"]
         console.print(f"[dim]Prompt: {prompt}[/dim]")
-        console.print(f"[dim]Model: {args.model}[/dim]")
         if args.PU is not None:
             unit = select_processing_unit(args.PU)
             console.print(

@@ -14,7 +14,13 @@
   "server": {
     "host": "127.0.0.1",
     "port": 8765,
-    "url": "http://127.0.0.1:8765"
+    "url": "http://127.0.0.1:8765",
+    "max_request_bytes": 4194304,
+    "max_batch_size": 256,
+    "max_pending_requests": 8,
+    "signature_refresh_interval_seconds": 1.0,
+    "embedding_batch_max_units": 256,
+    "embedding_batch_wait_ms": 5.0
   },
   "signature": {
     "version": 3,
@@ -54,7 +60,7 @@
     },
     "global_l1_top": 256,
     "memory_limit_mb": 0.0,
-    "cache_policy": "keep_l1_only",
+    "cache_policy": "release_after_layer",
     "confidence_decay": {
       "enabled": false,
       "max_delta": 0.18,

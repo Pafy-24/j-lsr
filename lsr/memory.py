@@ -8,41 +8,47 @@ from collections.abc import Mapping
 from typing import Any
 
 
-def current_process_ram_bytes() -> int:
+class ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+def current_process_memory_bytes() -> tuple[int, int]:
+    """Return current working-set/RSS and private bytes from one OS sample."""
     if os.name == "nt":
-        return current_process_ram_bytes_windows()
-    return current_process_ram_bytes_posix()
+        counters = process_memory_counters_windows()
+        if counters is None:
+            return 0, 0
+        return int(counters.WorkingSetSize), int(counters.PrivateUsage)
+    resident = current_process_ram_bytes_posix()
+    return resident, resident
+
+
+def current_process_ram_bytes() -> int:
+    return current_process_memory_bytes()[0]
 
 
 def current_process_ram_bytes_windows() -> int:
-    counters = process_memory_counters_windows()
-    return int(counters.WorkingSetSize) if counters is not None else 0
+    return current_process_memory_bytes()[0]
 
 
 def current_process_private_bytes() -> int:
-    if os.name != "nt":
-        return current_process_ram_bytes()
-    counters = process_memory_counters_windows()
-    return int(counters.PrivateUsage) if counters is not None else 0
+    return current_process_memory_bytes()[1]
 
 
 def process_memory_counters_windows() -> Any:
     from ctypes import wintypes
-
-    class ProcessMemoryCounters(ctypes.Structure):
-        _fields_ = [
-            ("cb", ctypes.c_ulong),
-            ("PageFaultCount", ctypes.c_ulong),
-            ("PeakWorkingSetSize", ctypes.c_size_t),
-            ("WorkingSetSize", ctypes.c_size_t),
-            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-            ("PagefileUsage", ctypes.c_size_t),
-            ("PeakPagefileUsage", ctypes.c_size_t),
-            ("PrivateUsage", ctypes.c_size_t),
-        ]
 
     counters = ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(ProcessMemoryCounters)
@@ -65,9 +71,18 @@ def process_memory_counters_windows() -> Any:
 
 
 def current_process_ram_bytes_posix() -> int:
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/statm", "r", encoding="ascii") as handle:
+                resident_pages = int(handle.read().split()[1])
+            return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+        except (IndexError, OSError, ValueError):
+            pass
     try:
         import resource
 
+        # Fallback for POSIX platforms without /proc. ru_maxrss is a peak,
+        # so Linux uses /proc above to keep memory-limit checks current.
         usage = resource.getrusage(resource.RUSAGE_SELF)
         factor = 1024 if sys.platform != "darwin" else 1
         return int(usage.ru_maxrss * factor)

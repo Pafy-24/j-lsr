@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# One-time ONNX export and A16W8 preparation for the AMD NPU.
+onnx==1.22.0
+amd-quark==0.12.post1

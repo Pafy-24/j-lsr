@@ -36,7 +36,7 @@ class LSRRouteService:
         self,
         signatures_path: str,
         model_name: str,
-        pu_index: int | None,
+        pu_index: int | str | None,
         online: bool,
         default_top_k: int,
         index_policy: str = "auto",
@@ -195,6 +195,23 @@ class LSRRouteService:
             signature_files = self.registry.signature_files_payload()
             stale_signatures = list(self.registry.stale_signatures)
             disabled_facets = sorted(self.registry.disabled_facets)
+        processing_units = (
+            self.monitor.processing_units_payload() if self.monitor is not None else []
+        )
+        selected_processing_unit = next(
+            (unit for unit in processing_units if unit.get("selected")),
+            None,
+        )
+        if selected_processing_unit is None:
+            unit = getattr(self.model, "processing_unit", None)
+            if unit is not None:
+                selected_processing_unit = {
+                    "index": unit.index,
+                    "kind": unit.kind,
+                    "name": unit.name,
+                    "backend": unit.backend,
+                    "luid": unit.luid or None,
+                }
         return {
             "status": "ok",
             "service": "LSR",
@@ -209,6 +226,11 @@ class LSRRouteService:
             "thresholds": router.thresholds_label(),
             "cachePolicy": router.cache_policy_label(),
             "embeddingBatcher": self.embedding_batcher.stats(),
+            "embeddingBackend": str(
+                getattr(self.model, "backend", type(self.model).__name__)
+            ),
+            "processingUnits": processing_units,
+            "selectedProcessingUnit": selected_processing_unit,
             "loadedLayers": loaded_layers,
             "loadedVectorBytes": loaded_vector_bytes,
             "memoryComponents": self.monitor.components_payload() if self.monitor is not None else [],
@@ -392,6 +414,9 @@ class LSRRouteService:
 
     def close(self) -> None:
         self.embedding_batcher.close()
+        close_model = getattr(self.model, "close", None)
+        if callable(close_model):
+            close_model()
 
 
 class LSRHTTPServer(HTTPServer):
@@ -605,7 +630,7 @@ def serve(
     port: int,
     signatures_path: str,
     model_name: str,
-    pu_index: int | None,
+    pu_index: int | str | None,
     online: bool,
     default_top_k: int,
     index_policy: str = "auto",

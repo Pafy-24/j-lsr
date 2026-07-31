@@ -20,6 +20,9 @@ signatures/
 
 *.log
 *.tmp
+original-info-signature.txt
+original-model-signature.txt
+quantized_info.csv
 .DS_Store
 Thumbs.db
 

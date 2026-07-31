@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 from typing import Any
 
@@ -56,8 +57,60 @@ def windows_compute_accelerators() -> list[dict[str, Any]]:
     )
 
 
+def windows_accelerator_counters(luids: list[str]) -> dict[str, dict[str, float]]:
+    """Read physical GPU/NPU engine and adapter-memory counters by Windows LUID."""
+    normalized = [
+        luid.upper()
+        for luid in luids
+        if re.fullmatch(r"[0-9A-Fa-f]{1,16}", str(luid or ""))
+    ]
+    if os.name != "nt" or not normalized:
+        return {}
+    ids = ",".join(f"'{luid}'" for luid in normalized)
+    rows = powershell_json(
+        "& { "
+        f"$ids=@({ids}); "
+        "foreach($id in $ids){ "
+        "$padded=$id.PadLeft(8,'0'); "
+        "$util=0.0; $dedicated=0.0; $shared=0.0; "
+        "try { "
+        "$samples=(Get-Counter \"\\GPU Engine(*luid_0x00000000_0x$padded*)"
+        "\\Utilization Percentage\" -ErrorAction Stop).CounterSamples.CookedValue; "
+        "if($samples){$util=($samples|Measure-Object -Maximum).Maximum} "
+        "} catch {} "
+        "try { "
+        "$memory=(Get-Counter "
+        "\"\\GPU Adapter Memory(*luid_0x00000000_0x$padded*)\\Dedicated Usage\","
+        "\"\\GPU Adapter Memory(*luid_0x00000000_0x$padded*)\\Shared Usage\" "
+        "-ErrorAction Stop).CounterSamples; "
+        "$dedicated=($memory|Where-Object {$_.Path -like '*dedicated usage'}|"
+        "Measure-Object CookedValue -Sum).Sum; "
+        "$shared=($memory|Where-Object {$_.Path -like '*shared usage'}|"
+        "Measure-Object CookedValue -Sum).Sum "
+        "} catch {} "
+        "[pscustomobject]@{Luid=$id;UtilizationPercent=[double]$util;"
+        "DedicatedBytes=[double]$dedicated;SharedBytes=[double]$shared} "
+        "} }"
+    )
+    counters: dict[str, dict[str, float]] = {}
+    for row in rows:
+        luid = str(row.get("Luid") or "").upper()
+        if not luid:
+            continue
+        counters[luid] = {
+            "utilizationPercent": float(row.get("UtilizationPercent") or 0.0),
+            "dedicatedBytes": float(row.get("DedicatedBytes") or 0.0),
+            "sharedBytes": float(row.get("SharedBytes") or 0.0),
+        }
+    return counters
+
+
 class ProcessingUnitDetector:
-    def detect(self) -> list[ProcessingUnit]:
+    def detect(
+        self,
+        include_windows_devices: bool = True,
+        include_npu: bool = True,
+    ) -> list[ProcessingUnit]:
         units: list[ProcessingUnit] = []
         cpu_name = platform.processor() or platform.machine() or "CPU"
         units.append(
@@ -104,13 +157,14 @@ class ProcessingUnitDetector:
 
         self._add_directml_units(units)
         self._add_xla_units(units)
-        self._add_windows_visible_units(units)
+        if include_windows_devices:
+            self._add_windows_ml_units(units, include_npu=include_npu)
+            self._add_windows_visible_units(units)
         return units
 
     def select(self, index: int | str | None) -> ProcessingUnit | None:
         if index is None:
             return None
-        units = self.detect()
         if isinstance(index, str):
             if index.lower() != "auto":
                 try:
@@ -118,7 +172,17 @@ class ProcessingUnitDetector:
                 except ValueError as exc:
                     raise RouterError("--PU must be an integer index or auto.") from exc
             else:
+                units = self.detect()
                 return self.select_auto(units)
+        basic_units = self.detect(include_windows_devices=False)
+        for unit in basic_units:
+            if unit.index == index and unit.usable:
+                return unit
+        dml_units = self.detect(include_npu=False)
+        for unit in dml_units:
+            if unit.index == index and unit.usable:
+                return unit
+        units = self.detect()
         for unit in units:
             if unit.index == index:
                 if not unit.usable:
@@ -135,7 +199,14 @@ class ProcessingUnitDetector:
         usable = [unit for unit in active_units if unit.usable]
         if not usable:
             return None
-        for preferred in ("torch.cuda", "torch.mps", "torch_directml", "torch_xla"):
+        for preferred in (
+            "torch.cuda",
+            "windowsml.vitisai",
+            "windowsml.dml",
+            "torch.mps",
+            "torch_directml",
+            "torch_xla",
+        ):
             for unit in usable:
                 if unit.backend == preferred:
                     return unit
@@ -180,6 +251,90 @@ class ProcessingUnitDetector:
         except Exception:
             pass
 
+    def _add_windows_ml_units(
+        self,
+        units: list[ProcessingUnit],
+        include_npu: bool = True,
+    ) -> None:
+        if os.name != "nt":
+            return
+        try:
+            from .windows_ml import DML_PROVIDER, VITIS_PROVIDER, windows_ml_devices
+
+            devices, npu_error = windows_ml_devices(include_npu=include_npu)
+        except Exception:
+            return
+
+        for item in devices:
+            provider = str(item.get("provider") or "")
+            name = str(item.get("name") or "").strip()
+            vendor = str(item.get("vendor") or "").lower()
+            metadata = {
+                str(key): str(value)
+                for key, value in dict(item.get("metadata") or {}).items()
+            }
+            if not name:
+                continue
+            if provider == DML_PROVIDER:
+                integrated = metadata.get("Discrete") == "0"
+                amd = "amd" in vendor or "advanced micro devices" in vendor
+                if not integrated or not amd or self._unit_exists(units, name):
+                    continue
+                units.append(
+                    ProcessingUnit(
+                        index=len(units),
+                        kind="iGPU",
+                        name=name,
+                        backend="windowsml.dml",
+                        device=f"LUID 0x{item.get('luid') or '?'}",
+                        usable=True,
+                        note="Windows ML / DirectML; explicitly bound to the integrated Radeon",
+                        provider=provider,
+                        luid=str(item.get("luid") or ""),
+                        metadata=metadata,
+                    )
+                )
+            elif include_npu and provider == VITIS_PROVIDER and not any(
+                unit.backend == "windowsml.vitisai" for unit in units
+            ):
+                units.append(
+                    ProcessingUnit(
+                        index=len(units),
+                        kind="NPU",
+                        name=name,
+                        backend="windowsml.vitisai",
+                        device=f"LUID 0x{item.get('luid') or '?'}",
+                        usable=True,
+                        note=(
+                            "Windows ML / Vitis AI; MiniLM requires "
+                            "onnx/model_npu_a16w8.onnx"
+                        ),
+                        provider=provider,
+                        luid=str(item.get("luid") or ""),
+                        metadata=metadata,
+                    )
+                )
+
+        if (
+            include_npu
+            and npu_error
+            and not any(unit.backend == "windowsml.vitisai" for unit in units)
+        ):
+            for accelerator in windows_compute_accelerators():
+                name = str(accelerator.get("FriendlyName") or "").strip()
+                if name and not self._unit_exists(units, name):
+                    units.append(
+                        ProcessingUnit(
+                            index=len(units),
+                            kind="NPU",
+                            name=name,
+                            backend="windowsml.vitisai",
+                            device="unavailable",
+                            usable=False,
+                            note=f"Windows ML Vitis AI registration failed: {npu_error}",
+                        )
+                    )
+
     def _add_windows_visible_units(self, units: list[ProcessingUnit]) -> None:
         for gpu in windows_gpu_devices():
             name = str(gpu.get("Name") or "").strip()
@@ -204,7 +359,11 @@ class ProcessingUnitDetector:
 
         for accelerator in windows_compute_accelerators():
             name = str(accelerator.get("FriendlyName") or "").strip()
-            if not name or self._unit_exists(units, name):
+            if (
+                not name
+                or self._unit_exists(units, name)
+                or any(unit.backend == "windowsml.vitisai" for unit in units)
+            ):
                 continue
             units.append(
                 ProcessingUnit(

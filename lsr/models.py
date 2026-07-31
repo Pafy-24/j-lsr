@@ -99,3 +99,6 @@ class ProcessingUnit:
     device: Any
     usable: bool
     note: str = ""
+    provider: str = ""
+    luid: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)

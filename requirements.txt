@@ -9,3 +9,13 @@ scikit-learn
 faiss-cpu
 rich
 psutil
+
+# Windows ML runtime for AMD Ryzen AI CPU/iGPU/NPU discovery and inference.
+onnxruntime-windowsml==1.25.2.202605110140; platform_system == "Windows"
+wasdk-Microsoft.Windows.AI.MachineLearning==2.3.0; platform_system == "Windows"
+wasdk-Microsoft.Windows.ApplicationModel.DynamicDependency.Bootstrap==2.3.0; platform_system == "Windows"
+winrt-runtime==3.2.1; platform_system == "Windows"
+winrt-Windows.Foundation==3.2.1; platform_system == "Windows"
+winrt-Windows.Foundation.Collections==3.2.1; platform_system == "Windows"
+winrt-Windows.ApplicationModel==3.2.1; platform_system == "Windows"
+pywin32==311; platform_system == "Windows"

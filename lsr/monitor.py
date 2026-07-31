@@ -7,8 +7,121 @@ import time
 from collections import deque
 from typing import Any
 
-from .devices import detect_processing_units
+from .devices import detect_processing_units, windows_accelerator_counters
 from .memory import cuda_memory_by_device, current_process_ram_bytes, current_vram_bytes, format_bytes
+
+
+class _WindowsAcceleratorSampler:
+    """Persistent PDH query for low-overhead GPU/NPU utilization and memory."""
+
+    def __init__(self, luids: list[str]):
+        self._pdh: Any = None
+        self._query: Any = None
+        self._engine_counters: dict[str, list[Any]] = {}
+        self._memory_counters: dict[str, dict[str, Any]] = {}
+        if os.name != "nt" or not luids:
+            return
+        try:
+            import win32pdh
+
+            self._pdh = win32pdh
+            self._query = win32pdh.OpenQuery()
+            normalized = {luid.upper() for luid in luids}
+            engine_instances = win32pdh.EnumObjectItems(
+                None,
+                None,
+                "GPU Engine",
+                win32pdh.PERF_DETAIL_WIZARD,
+            )[1]
+            memory_instances = win32pdh.EnumObjectItems(
+                None,
+                None,
+                "GPU Adapter Memory",
+                win32pdh.PERF_DETAIL_WIZARD,
+            )[1]
+            for luid in normalized:
+                needle = f"luid_0x00000000_0x{luid.zfill(8)}".lower()
+                for instance in engine_instances:
+                    if needle not in instance.lower():
+                        continue
+                    self._add_engine_counter(luid, instance)
+                for instance in memory_instances:
+                    if needle not in instance.lower():
+                        continue
+                    self._add_memory_counters(luid, instance)
+            win32pdh.CollectQueryData(self._query)
+        except Exception:
+            self.close()
+
+    @property
+    def available(self) -> bool:
+        return self._pdh is not None and self._query is not None
+
+    def _add_engine_counter(self, luid: str, instance: str) -> None:
+        try:
+            path = self._pdh.MakeCounterPath(
+                (None, "GPU Engine", instance, None, -1, "Utilization Percentage")
+            )
+            counter = self._pdh.AddCounter(self._query, path)
+            self._engine_counters.setdefault(luid, []).append(counter)
+        except Exception:
+            pass
+
+    def _add_memory_counters(self, luid: str, instance: str) -> None:
+        counters = self._memory_counters.setdefault(luid, {})
+        for key, counter_name in (
+            ("dedicatedBytes", "Dedicated Usage"),
+            ("sharedBytes", "Shared Usage"),
+        ):
+            try:
+                path = self._pdh.MakeCounterPath(
+                    (None, "GPU Adapter Memory", instance, None, -1, counter_name)
+                )
+                counters[key] = self._pdh.AddCounter(self._query, path)
+            except Exception:
+                pass
+
+    def sample(self) -> dict[str, dict[str, float]]:
+        if not self.available:
+            return {}
+        try:
+            self._pdh.CollectQueryData(self._query)
+            payload: dict[str, dict[str, float]] = {}
+            for luid in set(self._engine_counters) | set(self._memory_counters):
+                values = [
+                    float(
+                        self._pdh.GetFormattedCounterValue(
+                            counter,
+                            self._pdh.PDH_FMT_DOUBLE,
+                        )[1]
+                    )
+                    for counter in self._engine_counters.get(luid, [])
+                ]
+                item = {
+                    "utilizationPercent": max(values, default=0.0),
+                    "dedicatedBytes": 0.0,
+                    "sharedBytes": 0.0,
+                }
+                for key, counter in self._memory_counters.get(luid, {}).items():
+                    item[key] = float(
+                        self._pdh.GetFormattedCounterValue(
+                            counter,
+                            self._pdh.PDH_FMT_LARGE,
+                        )[1]
+                    )
+                payload[luid] = item
+            return payload
+        except Exception:
+            return {}
+
+    def close(self) -> None:
+        if self._pdh is not None and self._query is not None:
+            try:
+                self._pdh.CloseQuery(self._query)
+            except Exception:
+                pass
+        self._query = None
+        self._pdh = None
 
 
 class ServerMonitor:
@@ -25,6 +138,9 @@ class ServerMonitor:
         self._thread: threading.Thread | None = None
         self._started_at = time.monotonic()
         self._units = detect_processing_units()
+        self._windows_sampler = _WindowsAcceleratorSampler(
+            [unit.luid for unit in self._units if unit.luid]
+        )
         self._requests = 0
         self._last_ms = 0.0
         self._last_profile: dict[str, Any] = {}
@@ -33,7 +149,10 @@ class ServerMonitor:
         self._peak_ram = initial_ram
         self._components: dict[tuple[str, str], dict[str, Any]] = {}
         self._process = None
+        self._accelerator_lock = threading.Lock()
         self._gpu_samples: dict[int, tuple[float, str, str]] = {}
+        self._accelerator_sample: tuple[float, dict[str, dict[str, float]]] = (0.0, {})
+        self._accelerator_peaks: dict[str, float] = {}
         try:
             import psutil
 
@@ -52,8 +171,13 @@ class ServerMonitor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self._windows_sampler.close()
 
     def update(self, operation: str, detail: str = "") -> None:
+        if operation == "embedding" and self._selected_uses_windows_ml():
+            # Reset PDH's percentage interval immediately before inference so
+            # short iGPU/NPU requests are not diluted by a long idle period.
+            self._sample_windows_accelerators(record_peak=False)
         with self._lock:
             self._operation = operation
             self._detail = detail
@@ -94,6 +218,8 @@ class ServerMonitor:
             return [dict(item) for item in self._components.values()]
 
     def request_finished(self, elapsed_ms: float, profile: dict[str, Any] | None = None) -> None:
+        if self._selected_uses_windows_ml():
+            self._sample_windows_accelerators(record_peak=True)
         ram = current_process_ram_bytes()
         with self._lock:
             self._requests += 1
@@ -119,6 +245,73 @@ class ServerMonitor:
     def last_profile(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._last_profile)
+
+    def processing_units_payload(self) -> list[dict[str, Any]]:
+        cpu_total, cpu_process = self._cpu_usage()
+        accelerator_usage = self._windows_accelerator_usage()
+        selected_unit = getattr(self.service.model, "processing_unit", None)
+        payload: list[dict[str, Any]] = []
+        for unit in self._units:
+            item: dict[str, Any] = {
+                "index": unit.index,
+                "kind": unit.kind,
+                "name": unit.name,
+                "backend": unit.backend,
+                "usable": unit.usable,
+                "selected": (
+                    selected_unit is not None
+                    and getattr(selected_unit, "index", None) == unit.index
+                ),
+                "luid": unit.luid or None,
+                "utilizationPercent": None,
+                "utilizationLabel": "unavailable",
+                "memoryLabel": "-",
+            }
+            if unit.kind == "CPU":
+                item.update(
+                    {
+                        "systemUtilizationPercent": cpu_total,
+                        "processUtilizationPercent": cpu_process,
+                        "utilizationLabel": (
+                            f"system {cpu_total:.1f}% / LSR {cpu_process:.1f}%"
+                        ),
+                        "processRamBytes": current_process_ram_bytes(),
+                        "memoryLabel": format_bytes(current_process_ram_bytes()),
+                    }
+                )
+            elif unit.backend == "torch.cuda":
+                utilization, memory = self._cuda_usage(unit.device)
+                item["utilizationLabel"] = utilization
+                item["memoryLabel"] = memory
+                try:
+                    item["utilizationPercent"] = float(utilization.rstrip("%"))
+                except ValueError:
+                    pass
+            elif unit.luid and unit.luid in accelerator_usage:
+                counters = accelerator_usage[unit.luid]
+                utilization = float(counters["utilizationPercent"])
+                dedicated = int(counters["dedicatedBytes"])
+                shared = int(counters["sharedBytes"])
+                item.update(
+                    {
+                        "utilizationPercent": utilization,
+                        "peakObservedUtilizationPercent": self._accelerator_peaks.get(
+                            unit.luid,
+                            utilization,
+                        ),
+                        "utilizationLabel": f"{utilization:.1f}%",
+                        "dedicatedBytes": dedicated,
+                        "sharedBytes": shared,
+                        "memoryLabel": (
+                            f"dedicated {format_bytes(dedicated)} / "
+                            f"shared {format_bytes(shared)}"
+                        ),
+                    }
+                )
+            elif unit.usable:
+                item["utilizationLabel"] = "active" if unit.backend in self._detail else "idle"
+            payload.append(item)
+        return payload
 
     def _run(self) -> None:
         from rich.console import Console
@@ -157,18 +350,14 @@ class ServerMonitor:
         pu_table.add_column("Backend")
         pu_table.add_column("Util", justify="right")
         pu_table.add_column("Memory", justify="right")
-        cpu_total, cpu_process = self._cpu_usage()
-        for unit in self._units:
-            utilization = "unavailable"
-            memory = "-"
-            if unit.kind == "CPU":
-                utilization = f"system {cpu_total:.1f}% / LSR {cpu_process:.1f}%"
-                memory = format_bytes(current_process_ram_bytes())
-            elif unit.backend == "torch.cuda":
-                utilization, memory = self._cuda_usage(unit.device)
-            elif unit.usable:
-                utilization = "active" if unit.backend in detail else "idle"
-            pu_table.add_row(f"{unit.index} {unit.kind} {unit.name}", unit.backend, utilization, memory)
+        for unit in self.processing_units_payload():
+            selected = " [bold green]*[/bold green]" if unit["selected"] else ""
+            pu_table.add_row(
+                f"{unit['index']} {unit['kind']} {unit['name']}{selected}",
+                str(unit["backend"]),
+                str(unit["utilizationLabel"]),
+                str(unit["memoryLabel"]),
+            )
 
         ram_table = self._component_table("RAM components", "RAM", components)
         vram_table = self._component_table("VRAM components", "VRAM", components)
@@ -259,6 +448,41 @@ class ServerMonitor:
             return result
         except Exception:
             return "unavailable", format_bytes(current_vram_bytes())
+
+    def _windows_accelerator_usage(self) -> dict[str, dict[str, float]]:
+        luids = [unit.luid for unit in self._units if unit.luid]
+        if not luids:
+            return {}
+        now = time.monotonic()
+        sampled_at, cached = self._accelerator_sample
+        if now - sampled_at < 0.5:
+            return cached
+        return self._sample_windows_accelerators(record_peak=True)
+
+    def _selected_uses_windows_ml(self) -> bool:
+        unit = getattr(self.service.model, "processing_unit", None)
+        return str(getattr(unit, "backend", "")).startswith("windowsml.")
+
+    def _sample_windows_accelerators(
+        self,
+        record_peak: bool,
+    ) -> dict[str, dict[str, float]]:
+        luids = [unit.luid for unit in self._units if unit.luid]
+        if not luids:
+            return {}
+        with self._accelerator_lock:
+            counters = self._windows_sampler.sample()
+            if not counters and not self._windows_sampler.available:
+                counters = windows_accelerator_counters(luids)
+            self._accelerator_sample = (time.monotonic(), counters)
+            if record_peak:
+                for luid, item in counters.items():
+                    utilization = float(item.get("utilizationPercent", 0.0))
+                    self._accelerator_peaks[luid] = max(
+                        self._accelerator_peaks.get(luid, 0.0),
+                        utilization,
+                    )
+            return counters
 
     @staticmethod
     def _nvidia_utilization(index: int) -> float:

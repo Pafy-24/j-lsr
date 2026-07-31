@@ -13,6 +13,7 @@ From a terminal:
 ```powershell
 conda activate licenta
 cd E:\Licenta\Proiect\LSR
+python -m pip install -r requirements-windows-ml-dev.txt
 ```
 
 ## Project Layout
@@ -26,6 +27,7 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\dataset_schema.py` - `pretrain/core/finetune` JSONL loader/adapters
 - `lsr\devices.py` - processing-unit discovery and selection
 - `lsr\embedding.py` - model loading and embedding helpers
+- `lsr\windows_ml.py` - Windows ML device registration and ONNX embeddings
 - `lsr\input_digest.py` - deterministic digest mode for very large inputs
 - `lsr\memory.py` - process RAM/VRAM footprint checks and release hooks
 - `lsr\registry.py` - server-side signature registry and stale-file refresh
@@ -33,6 +35,7 @@ cd E:\Licenta\Proiect\LSR
 - `lsr\signatures.py` - signature building, loading, saving, and DER codec
 - `lsr\routing.py` - layered routing, lazy loading policy, and hierarchical search
 - `requirements.txt` - Python dependencies
+- `requirements-windows-ml-dev.txt` - AMD NPU model-preparation dependencies
 - `..\facets\Crypto\datasets\train\crypto_dataset.json` - full raw Crypto training dataset
 - `..\facets\Web\datasets\train\WebMainBench_545.jsonl` - WebMainBench calibrated subset for Web routing tests
 - `..\facets\signatures\crypto.sig` - ASN.1 DER hierarchical routing signature for Crypto
@@ -350,7 +353,7 @@ Invoke-RestMethod `
 
 Supported endpoints:
 
-- `GET /health` - returns model, loading policy, cache policy, process RAM/VRAM, thresholds, signature path, loaded facets, loaded layers, loaded vector bytes, signature files, stale signatures, and default `top_k`
+- `GET /health` - also returns `embeddingBackend`, `selectedProcessingUnit`, and live CPU/GPU/iGPU/NPU counters under `processingUnits`
 - `POST /rank` - accepts `{"input": "..."}`; `prompt`, `text`, `full_depth`, and `large_input` are also accepted
 - `POST /route` - compatibility alias for `/rank`
 - `POST /batch` - accepts `{"inputs": ["..."]}`; `prompts`, `texts`, `full_depth`, and `large_input` are also accepted
@@ -426,7 +429,64 @@ python router.py rank "How do I verify an ECDSA signature?"
 
 `--PUs` always includes CPU index `0`. It also reports GPUs/NPUs detected by Windows even when the current Python backend cannot use them. The `Usable` column tells whether `--PU <index>` can actually be used for embeddings.
 
-On this machine, the `licenta` environment uses Python 3.11 and `torch 2.11.0+cu128`. The NVIDIA RTX GPU is usable through `torch.cuda` and appears as `--PU 1`. Windows also detects the AMD NPU, but it remains unusable for the current SentenceTransformer/PyTorch backend.
+On the Ryzen AI 9 365 development machine, the current mapping is:
+
+```text
+0  CPU   torch                 Ryzen AI 9 CPU
+1  GPU   torch.cuda            NVIDIA RTX 5070 Laptop GPU
+2  iGPU  windowsml.dml         AMD Radeon 880M
+3  NPU   windowsml.vitisai     AMD NPU Compute Accelerator
+```
+
+The indexes are discovered at runtime, so use `--PUs` instead of assuming this
+mapping on another machine. DirectML is bound by LUID to the integrated Radeon;
+it cannot silently select the discrete NVIDIA adapter.
+
+The iGPU uses the upstream `onnx/model.onnx` export. Cache it once if needed:
+
+```powershell
+python router.py rank "warm cache" --local `
+  --signatures ..\facets\signatures --PU 2 --online
+```
+
+The NPU needs a static A16W8 graph prepared once with AMD Quark. Run this from a
+Visual Studio Developer PowerShell so `cl.exe` is available:
+
+```powershell
+conda activate licenta
+cd E:\Licenta\Proiect\LSR
+$env:CUDA_VISIBLE_DEVICES = "-1"
+python scripts\prepare_windows_ml_model.py `
+  --calibration ..\facets\Crypto\datasets\train `
+  --calibration ..\facets\Web\datasets\train
+```
+
+The generated `onnx/model_npu_a16w8.onnx` stays in the Hugging Face model cache;
+it is not committed to the repository. Vitis currently requires batch 1 for
+this MiniLM graph. `WindowsMLEmbeddingModel` handles that constraint internally,
+including when the server micro-batcher submits several semantic units.
+The compiled Vitis artifact is cached under `.lsr_vitis_cache`, keyed by model
+hash and EP version. The first NPU session still performs a long compilation;
+later processes reuse the compiled `xmodel` and start faster.
+
+Verified on this machine on 2026-07-29:
+
+- iGPU output cosine versus CPU FP32: at least `0.99999994`; physical Radeon
+  utilization reached `2.01%` during the sustained probe.
+- NPU output cosine versus CPU FP32: `0.9546` to `0.9791` on the smoke prompts;
+  physical NPU utilization reached `2.59%`.
+- The 100-item Crypto/Web evaluation on the 64-sample calibrated NPU model
+  matched the CPU routing metrics: recall@1 `0.81`, recall@3 `0.88`, MRR
+  `0.845`, false-positive rate `0.08`. Its p50 routing latency was `88.08 ms`;
+  NPU execution is therefore functional but is not a latency win for this
+  small, partially offloaded MiniLM graph.
+
+Run a sustained hardware probe with:
+
+```powershell
+python scripts\probe_windows_ml.py --PU 2 --iterations 100
+python scripts\probe_windows_ml.py --PU 3 --iterations 100
+```
 
 ## Example Result
 
@@ -460,12 +520,15 @@ facets
 ```
 
 The server terminal displays a live dashboard by default. It shows the current
-routing/embedding operation, CPU and GPU utilization, process RAM, CUDA VRAM,
+routing/embedding operation, CPU, CUDA GPU, Radeon iGPU, and AMD NPU utilization,
+process RAM, CUDA VRAM, and physical dedicated/shared accelerator memory,
 loaded signature layers, vector bytes, request count, and last-request latency.
 RAM and VRAM inventories are separate and attribute memory to the embedding
 model, signature metadata, active vector layers, CUDA allocator cache, and
 unattributed runtime/native allocations. The same tracked allocations are
 available as `memoryComponents` from `GET /health`.
+The Windows accelerator counters are read by physical LUID through a persistent
+PDH query, so monitoring does not launch PowerShell once per refresh.
 Model parameter and buffer bytes are counted from their actual tensor devices.
 The RAM delta caused by importing PyTorch/Transformers, loading the tokenizer,
 CUDA driver mappings, and native libraries is reported separately as

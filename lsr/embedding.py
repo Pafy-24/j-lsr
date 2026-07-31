@@ -35,7 +35,7 @@ class EmbeddingService:
     def __init__(
         self,
         model_name: str,
-        pu_index: int | None = None,
+        pu_index: int | str | None = None,
         online: bool = False,
         model: Any | None = None,
     ):
@@ -58,12 +58,19 @@ class EmbeddingService:
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         unit = select_processing_unit(self.pu_index)
+        if unit is not None and unit.backend.startswith("windowsml."):
+            from .windows_ml import load_windows_ml_model
+
+            return load_windows_ml_model(self.model_name, unit, self.online)
         sentence_transformer_class = get_sentence_transformer_class()
         kwargs = {"local_files_only": not self.online}
         try:
             if unit is None:
                 return sentence_transformer_class(self.model_name, **kwargs)
-            return sentence_transformer_class(self.model_name, device=unit.device, **kwargs)
+            model = sentence_transformer_class(self.model_name, device=unit.device, **kwargs)
+            model.processing_unit = unit
+            model.backend = unit.backend
+            return model
         except OSError as exc:
             if not self.online:
                 raise RouterError(
@@ -206,12 +213,22 @@ def embed_texts(model: Any, texts: list[str]) -> Any:
     return np.asarray(embeddings, dtype=np.float32)
 
 
-def load_model(model_name: str, pu_index: int | None = None, online: bool = False) -> Any:
+def load_model(
+    model_name: str,
+    pu_index: int | str | None = None,
+    online: bool = False,
+) -> Any:
     return EmbeddingService(model_name, pu_index, online).model
 
 
 def model_tensor_bytes_by_device(model: Any) -> dict[str, int]:
     """Count owned model parameters/buffers by their actual tensor device."""
+    model_bytes = getattr(model, "model_bytes", None)
+    processing_unit = getattr(model, "processing_unit", None)
+    if callable(model_bytes) and processing_unit is not None:
+        kind = str(getattr(processing_unit, "kind", "device")).lower()
+        return {kind: int(model_bytes())}
+
     totals: dict[str, int] = {}
     seen: set[int] = set()
     for accessor in ("parameters", "buffers"):

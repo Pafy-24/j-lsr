@@ -54,6 +54,17 @@ class DatasetProjectionTests(unittest.TestCase):
         self.assertNotIn("SECRET coder.python CONDITIONING", route_text)
         self.assertNotIn("coder.python", route_text)
 
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "training.jsonl"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            item = load_lsr_dataset(path)[0]
+
+        self.assertEqual(item.expected_facets, ["coder.python"])
+        self.assertEqual(
+            item.metadata["activation"]["activeFacets"],
+            ["coder", "coder.python"],
+        )
+
     def test_canonical_directory_signing_excludes_test_split(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

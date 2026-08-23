@@ -126,7 +126,15 @@ def decode_canonical_facet_record(
         raise RouterError(f"Canonical facet record {index} is missing facet.")
     item_id = str(item.get("id") or f"{facet}-{index}").strip()
     activation = item.get("activation") if isinstance(item.get("activation"), dict) else {}
-    expected = activation.get("activeFacets") or activation.get("active_facets") or [facet]
+    expected = (
+        activation.get("directSelectedFacets")
+        or activation.get("direct_selected_facets")
+        or activation.get("directFacets")
+        or activation.get("direct_facets")
+    )
+    if not expected:
+        primary = activation.get("primaryFacet") or activation.get("primary_facet")
+        expected = [primary] if isinstance(primary, str) and primary.strip() else [facet]
     expected_facets = normalize_expected_facets(expected, facet)
     metadata: dict[str, Any] = {}
     for field in ("coverage", "provenance", "supervision"):

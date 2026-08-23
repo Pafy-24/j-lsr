@@ -410,6 +410,14 @@ class RouterCLI:
         confidences: list[float] = []
         weights: list[float] = []
         selected_counts: list[float] = []
+        selection_precisions: list[float] = []
+        selection_recalls: list[float] = []
+        selection_f1_scores: list[float] = []
+        extraneous_counts: list[float] = []
+        missing_counts: list[float] = []
+        exact_set_matches = 0
+        over_selections = 0
+        under_selections = 0
         separations: list[float] = []
         separation_ratios: list[float] = []
         lexical_scores: list[float] = []
@@ -435,6 +443,25 @@ class RouterCLI:
             facets = [str(result["facet"]).lower() for result in selected]
             selected_counts.append(float(len(selected)))
             expected_set = {facet.lower() for facet in expected_facets}
+            selected_set = set(facets)
+            true_positives = len(selected_set & expected_set)
+            precision = true_positives / len(selected_set) if selected_set else 0.0
+            recall = true_positives / len(expected_set) if expected_set else 1.0
+            selection_precisions.append(precision)
+            selection_recalls.append(recall)
+            selection_f1_scores.append(
+                0.0 if precision + recall == 0.0 else 2.0 * precision * recall / (precision + recall)
+            )
+            extraneous = len(selected_set - expected_set)
+            missing = len(expected_set - selected_set)
+            extraneous_counts.append(float(extraneous))
+            missing_counts.append(float(missing))
+            if selected_set == expected_set:
+                exact_set_matches += 1
+            if extraneous:
+                over_selections += 1
+            if missing:
+                under_selections += 1
             rank = next((index + 1 for index, facet in enumerate(facets) if facet in expected_set), None)
             ranks.append(rank)
             if facets and facets[0] not in expected_set:
@@ -466,7 +493,18 @@ class RouterCLI:
             "recall@3": sum(1 for rank in ranks if rank is not None and rank <= 3) / total,
             "mrr": sum((1 / rank) for rank in ranks if rank) / total,
             "falsePositiveRate": false_positives / total,
+            "falsePositiveRateSemantics": "top-1-selected-facet-not-in-expected-set",
             "refusedRate": refused / total,
+            "selectionSet": {
+                "precisionMacro": sum(selection_precisions) / total,
+                "recallMacro": sum(selection_recalls) / total,
+                "f1Macro": sum(selection_f1_scores) / total,
+                "exactMatchRate": exact_set_matches / total,
+                "overSelectionRate": over_selections / total,
+                "underSelectionRate": under_selections / total,
+                "extraneousFacetCount": metric_summary(extraneous_counts),
+                "missingExpectedFacetCount": metric_summary(missing_counts),
+            },
             "decisionsByLayer": decisions_by_layer,
             "confidenceDecay": metric_summary(decays),
             "confidence": metric_summary(confidences),

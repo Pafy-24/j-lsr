@@ -29,6 +29,7 @@ from .monitor import ServerMonitor
 from .profiling import RankProfiler
 from .registry import SignatureRegistry
 from .routing import LSRRouter, json_ready_route
+from .routing_context import agent_event_to_text
 
 
 class LSRRouteService:
@@ -532,6 +533,12 @@ def extract_prompt(payload: Any) -> str:
         return payload
     if not isinstance(payload, dict):
         raise RouterError("Request body must be an object or prompt string.")
+    event = payload.get("agentEvent")
+    if event is None:
+        event = payload.get("agent_event")
+    if event is not None:
+        task_context = payload.get("taskContext") or payload.get("task_context")
+        return agent_event_to_text(event, task_context)
     prompt = payload.get("input") or payload.get("prompt") or payload.get("text")
     if not isinstance(prompt, str):
         raise RouterError("Request body must include input, prompt, or text.")
@@ -556,10 +563,10 @@ def extract_prompts(payload: Any) -> list[str]:
         if isinstance(item, str):
             prompts.append(item)
         elif isinstance(item, dict):
-            prompt = item.get("input") or item.get("prompt") or item.get("text")
-            if not isinstance(prompt, str):
-                raise RouterError(f"Batch item {index} has no prompt text.")
-            prompts.append(prompt)
+            try:
+                prompts.append(extract_prompt(item))
+            except RouterError as exc:
+                raise RouterError(f"Batch item {index}: {exc}") from exc
         else:
             raise RouterError(f"Batch item {index} must be a string or object.")
     return prompts

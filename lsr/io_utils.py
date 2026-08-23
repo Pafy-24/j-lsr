@@ -78,6 +78,8 @@ def load_dataset(path: str | Path) -> list[dict[str, Any]]:
     except json.JSONDecodeError as exc:
         data = load_jsonl_dataset(raw, path, exc)
 
+    if isinstance(data, dict):
+        data = [data]
     if not isinstance(data, list):
         raise RouterError("Dataset must be a JSON list of objects.")
     for index, item in enumerate(data):

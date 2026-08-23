@@ -9,6 +9,7 @@ from .dataset import examples_from_dataset, infer_facet_from_paths
 from .errors import RouterError
 from .io_utils import load_dataset, read_file
 from .models import RouteExample
+from .routing_context import facet_record_to_routing_text, messages_to_routing_text
 
 DATASET_STAGES = ("pretrain", "core", "finetune")
 
@@ -45,6 +46,13 @@ def expand_dataset_paths(path: str | Path) -> list[Path]:
 
     dataset_path = Path(path)
     if dataset_path.is_dir():
+        canonical_train_files = [
+            dataset_path / filename
+            for filename in ("pretraining.jsonl", "training.jsonl")
+            if (dataset_path / filename).is_file()
+        ]
+        if canonical_train_files:
+            return canonical_train_files
         files = [
             file_path
             for file_path in sorted(dataset_path.glob("*.jsonl"))
@@ -70,6 +78,12 @@ def load_lsr_dataset_file(path: Path, default_facet: str | None = None) -> list[
         raw_items = load_dataset(path)
     except RouterError:
         raise
+
+    if raw_items and all(is_canonical_facet_record(item) for item in raw_items):
+        return [
+            decode_canonical_facet_record(item, index, path, default_facet)
+            for index, item in enumerate(raw_items)
+        ]
 
     stage = dataset_stage_from_path(path)
     if stage in DATASET_STAGES and all(is_stage_item(item, stage) for item in raw_items):
@@ -97,6 +111,40 @@ def is_stage_item(item: dict[str, Any], stage: str) -> bool:
     return isinstance(item.get("messages"), list)
 
 
+def is_canonical_facet_record(item: dict[str, Any]) -> bool:
+    return item.get("schemaVersion") == "facet-record-v3"
+
+
+def decode_canonical_facet_record(
+    item: dict[str, Any],
+    index: int,
+    path: Path,
+    default_facet: str | None = None,
+) -> LSRDatasetItem:
+    facet = str(item.get("facet") or default_facet or infer_dataset_facet(path)).strip().lower()
+    if not facet:
+        raise RouterError(f"Canonical facet record {index} is missing facet.")
+    item_id = str(item.get("id") or f"{facet}-{index}").strip()
+    activation = item.get("activation") if isinstance(item.get("activation"), dict) else {}
+    expected = activation.get("activeFacets") or activation.get("active_facets") or [facet]
+    expected_facets = normalize_expected_facets(expected, facet)
+    metadata: dict[str, Any] = {}
+    for field in ("coverage", "provenance", "supervision"):
+        value = item.get(field)
+        if isinstance(value, dict):
+            metadata[field] = value
+    metadata["activation"] = activation
+    return LSRDatasetItem(
+        id=item_id,
+        facet=facet,
+        texts=[facet_record_to_routing_text(item, index)],
+        expected_facets=expected_facets,
+        metadata=metadata,
+        split=str(item.get("split") or infer_dataset_split(path)),
+        stage=str(item.get("stage") or "sft"),
+    )
+
+
 def decode_stage_item(
     item: dict[str, Any],
     index: int,
@@ -109,7 +157,7 @@ def decode_stage_item(
         text = str(item.get("text") or "").strip()
         texts = [text] if text else []
     else:
-        texts = [messages_to_text(item.get("messages"), index)]
+        texts = [messages_to_routing_text(item.get("messages"), index)]
     if not texts or not any(text.strip() for text in texts):
         raise RouterError(f"{stage} dataset item {index} has no routable text.")
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
@@ -125,19 +173,7 @@ def decode_stage_item(
 
 
 def messages_to_text(messages: Any, index: int) -> str:
-    if not isinstance(messages, list) or not messages:
-        raise RouterError(f"messages item {index} must contain a non-empty messages list.")
-    parts: list[str] = []
-    for message_index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            raise RouterError(f"messages item {index}.{message_index} must be an object.")
-        role = str(message.get("role") or "").strip()
-        content = str(message.get("content") or "").strip()
-        if content:
-            parts.append(f"{role}: {content}" if role else content)
-    if not parts:
-        raise RouterError(f"messages item {index} has no message content.")
-    return "\n".join(parts)
+    return messages_to_routing_text(messages, index)
 
 
 def is_legacy_lsr_item(item: dict[str, Any]) -> bool:

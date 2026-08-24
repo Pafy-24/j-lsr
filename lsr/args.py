@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--PUs",
         action="store_true",
-        help="List available processing units and exit.",
+        help="Deprecated: hardware inventory moved to `jester-rm resources list`.",
     )
 
     subparsers = parser.add_subparsers(dest="command")

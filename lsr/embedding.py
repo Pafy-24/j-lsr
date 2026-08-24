@@ -11,6 +11,7 @@ from typing import Any
 from .dependencies import ensure_numpy, get_sentence_transformer_class
 from .devices import select_processing_unit
 from .errors import RouterError
+from .rm_integration import managed_processing_unit
 
 
 def normalize_matrix(matrix: Any) -> Any:
@@ -57,7 +58,9 @@ class EmbeddingService:
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-        unit = select_processing_unit(self.pu_index)
+        unit = managed_processing_unit()
+        if unit is None:
+            unit = select_processing_unit(self.pu_index)
         if unit is not None and unit.backend.startswith("windowsml."):
             from .windows_ml import load_windows_ml_model
 

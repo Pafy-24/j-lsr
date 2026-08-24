@@ -16,6 +16,20 @@ cd E:\Licenta\Proiect\LSR
 python -m pip install -r requirements-windows-ml-dev.txt
 ```
 
+## Resource Manager boundary
+
+LSR nu mai deține inventarul sau alocarea hardware. Orice comandă care încarcă modelul local (`serve`, `sign`, `benchmark-models`, `evaluate`, `rank --local`) trebuie pornită prin Jester Resource Manager și primește CPU/CUDA/DirectML/VitisAI din lease. `--PUs` a fost înlocuit de:
+
+```powershell
+cd E:\Licenta\Proiect\RM
+jester-rm resources list --json
+jester-rm instance create examples\instance-lsr-npu.json
+jester-rm instance plan lsr-npu-01
+jester-rm instance start lsr-npu-01
+```
+
+`--PU` și `--memory-limit-mb` sunt respinse în workloadurile managed; limitele se declară în profilul RM. Fragmentele locale de comandă din secțiunile algoritmice de mai jos descriu argumentele adaptorului `lsr.task`/`lsr.serve`, nu o cale operațională care ocolește RM. `loadsig`, `unloadsig` și rank către un server existent nu alocă hardware local și pot fi apelate direct.
+
 ## Project Layout
 
 - `router.py` - thin CLI compatibility entry point
@@ -195,7 +209,7 @@ Default runtime behavior:
 
 There is no persistent global L1 index in runtime routing. `loadingPolicy=streaming-release-layer` means each layer is read with `seek/read`, compared, and removed before the next layer is loaded.
 
-For memory-constrained runs, pass `--memory-limit-mb N`. The limit is checked against the current process RAM plus tracked CUDA VRAM before loading each layer or candidate view. If the model/process already exceeds the limit, routing fails clearly instead of loading more signature data.
+The router still has a library-level footprint guard before loading each signature layer, but operational limits are declared as RM `ramBytes` and accelerator `memoryBudgetBytes`. The managed CLI rejects `--memory-limit-mb`, so there is one resource authority and one auditable lease.
 
 Layer decisions use per-layer thresholds from `lsr\defaults.json`:
 
@@ -306,17 +320,17 @@ Use `--online` only when the model is not already cached and the machine is allo
 
 ## Serve Mode
 
-For interactive use or integrations, LSR can keep the model and signatures loaded in a local HTTP server:
+For interactive use or integrations, LSR can keep the model and signatures loaded in an RM-managed HTTP server. Configurează `component.arguments` cu `--signatures ...`; hostul și portul sunt injectate de adaptor:
 
 ```powershell
-python router.py serve `
-  --signatures ..\facets\signatures `
-  --host 127.0.0.1 `
-  --port 8765 `
-  --PU 1
+jester-rm instance start lsr-serve-01
+jester-rm operations inspect <OPERATION_ID>
+jester-rm instance status lsr-serve-01
 ```
 
 Health check:
+
+Folosește portul din lease/status (sau declară `network.port: 8765`):
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/health
@@ -384,7 +398,8 @@ Before each rank request, the server refreshes the signature registry. Deleted `
 Signature loading can be controlled through CLI commands while the server is running:
 
 ```powershell
-python router.py serve --no-load --host 127.0.0.1 --port 8765 --PU 1
+# pornește o instanță lsr.serve al cărei component.arguments conține --no-load
+jester-rm instance start lsr-serve-empty-01
 python router.py loadsig --signatures ..\facets\signatures --server http://127.0.0.1:8765
 python router.py unloadsig --facet crypto --server http://127.0.0.1:8765
 python router.py unloadsig --all --server http://127.0.0.1:8765
@@ -394,40 +409,24 @@ Signing remains a CLI operation. When `serve` watches a signature directory, upd
 
 The server uses the same local-only model loading rule as CLI routing. Use `--online` only when the model is not already cached locally.
 
-First run on a fresh environment:
+La primul run într-un mediu fără model cached, adaugă `--online` în `component.arguments`, apoi recreează generația/lease-ul. După cache, elimină flag-ul; hash-ul effective config va reflecta alegerea.
 
 ```powershell
-python router.py serve --signatures ..\facets\signatures --online
+jester-rm instance inspect lsr-serve-01
+jester-rm instance restart lsr-serve-01
 ```
 
-After the model is cached, omit `--online`.
+## RM bindings și pregătirea Windows ML
 
-## Processing Units
-
-List processing units visible to the router:
+Inventarul canonic și selecția sunt făcute cu ID-uri stabile:
 
 ```powershell
-python router.py --PUs
+jester-rm resources list --json
+jester-rm profile validate lsr-npu --adapter lsr.serve
+jester-rm instance plan lsr-npu-01
 ```
 
-Select a processing unit for signing or routing:
-
-```powershell
-python router.py sign `
-  -in ..\facets\Crypto\datasets\train\crypto_dataset.json `
-  --signatures ..\facets\signatures `
-  --PU 1
-```
-
-```powershell
-python router.py serve `
-  --signatures ..\facets\signatures `
-  --PU 1
-
-python router.py rank "How do I verify an ECDSA signature?"
-```
-
-`--PUs` always includes CPU index `0`. It also reports GPUs/NPUs detected by Windows even when the current Python backend cannot use them. The `Usable` column tells whether `--PU <index>` can actually be used for embeddings.
+CPU folosește `processorIds`, NVIDIA folosește UUID, iar iGPU/NPU folosesc provider + LUID. Lease-ul traduce binding-ul fizic în vizibilitatea runtime; LSR verifică providerul și LUID-ul înainte de embedding și refuză fallback-ul tăcut.
 
 On the Ryzen AI 9 365 development machine, the current mapping is:
 
@@ -438,15 +437,12 @@ On the Ryzen AI 9 365 development machine, the current mapping is:
 3  NPU   windowsml.vitisai     AMD NPU Compute Accelerator
 ```
 
-The indexes are discovered at runtime, so use `--PUs` instead of assuming this
-mapping on another machine. DirectML is bound by LUID to the integrated Radeon;
-it cannot silently select the discrete NVIDIA adapter.
+Numerele din stânga sunt doar vechea ordine diagnostică și nu se persistă. Copiază `resourceId` din RM. DirectML este legat prin LUID de Radeon-ul integrat și nu poate selecta silențios placa NVIDIA discretă.
 
 The iGPU uses the upstream `onnx/model.onnx` export. Cache it once if needed:
 
 ```powershell
-python router.py rank "warm cache" --local `
-  --signatures ..\facets\signatures --PU 2 --online
+python scripts\probe_windows_ml.py --PU 2 --iterations 1
 ```
 
 The NPU needs a static A16W8 graph prepared once with AMD Quark. Run this from a
@@ -666,16 +662,16 @@ python router.py benchmark-models [--options]
 python router.py evaluate [--options]
 
 Global:
---PUs                 List available processing units and exit
+--PUs                 Deprecated; exits with RM_LEASE_REQUIRED. Use jester-rm resources list.
 
 Common runtime options:
 --model NAME|auto     SentenceTransformer model name, default sentence-transformers/all-MiniLM-L6-v2,
                       or infer from .sig metadata
 --online              Allow model downloads/checks; default is local-only
---PU N|auto           Use processing unit index N, or auto-select a usable PU
+--PU N|auto           Legacy parser field; rejected for managed workloads. Device comes from lease.
 --index auto|flat|hnsw
                        Vector index backend; auto uses global L1 FlatIP and HNSW for large layers
---memory-limit-mb N   0 disables the limit; >0 checks total RAM/VRAM before each layer load
+--memory-limit-mb N   Legacy parser field; rejected for managed workloads. RAM/VRAM come from lease.
 --descend-threshold N Override all per-layer pass thresholds from defaults.json
 --accept-threshold N  Override all per-layer accept thresholds from defaults.json
 --large-input auto|off|force

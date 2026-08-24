@@ -39,7 +39,8 @@ def _shutdown_windows_app_sdk() -> None:
 
 
 def _add_winui3_to_path() -> None:
-    for package_root in site.getsitepackages():
+    package_roots = [*site.getsitepackages(), site.getusersitepackages()]
+    for package_root in dict.fromkeys(package_roots):
         winui3_path = Path(package_root) / "winui3"
         if winui3_path.is_dir() and str(winui3_path) not in sys.path:
             sys.path.insert(0, str(winui3_path))

@@ -22,6 +22,7 @@ from .model_selection import resolve_model_name, validate_signature_model_compat
 from .models import FacetSignature
 from .profiling import RankProfiler
 from .routing import LSRRouter, json_ready_route
+from .rm_integration import require_managed_launch, start_telemetry
 from .server import serve
 from .signatures import SignatureBuilder, SignatureStore
 
@@ -831,7 +832,10 @@ def post_json(server_url: str, path: str, payload: Any, timeout: int = 60) -> An
 
 def main() -> int:
     args = parse_args()
+    telemetry = None
     try:
+        require_managed_launch(args)
+        telemetry = start_telemetry()
         return RouterCLI(args).run()
     except RouterError as exc:
         error_console.print(f"[red]Error:[/red] {exc}")
@@ -839,3 +843,6 @@ def main() -> int:
     except KeyboardInterrupt:
         error_console.print("\n[red]Interrupted.[/red]")
         return 130
+    finally:
+        if telemetry is not None:
+            telemetry.close()

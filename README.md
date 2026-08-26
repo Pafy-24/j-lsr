@@ -207,7 +207,7 @@ Default runtime behavior:
 6. descend only facets whose current layer decision is `passed`
 ```
 
-There is no persistent global L1 index in runtime routing. `loadingPolicy=streaming-release-layer` means each layer is read with `seek/read`, compared, and removed before the next layer is loaded.
+There is no persistent global L1 index in runtime routing. `loadingPolicy=streaming-release-layer` means each vector layer is read with `seek/read`, compared, and removed before the next layer is loaded. Immutable parent-child topology is retained separately in a compact CSR-style `uint32` cache, so repeated requests do not decode thousands of DER integers again. The cache is shared safely by request-local routing copies and is reported independently from transient vector memory.
 
 The router still has a library-level footprint guard before loading each signature layer, but operational limits are declared as RM `ramBytes` and accelerator `memoryBudgetBytes`. The managed CLI rejects `--memory-limit-mb`, so there is one resource authority and one auditable lease.
 
@@ -551,6 +551,21 @@ descended beyond L1. This makes memory scaling measurable without actually
 loading hundreds or thousands of complete signatures at once.
 It also projects the observed average signature sizes to 100, 1,000, and
 10,000 facets for both all-L1-resident and eager-all-layers policies.
+`persistentTopologyCacheBytes`, `persistentTopologyCacheLevels` and
+`peakResidentSignatureBytes` make the latency/memory trade-off explicit.
+
+The route-only hot path can be reproduced without embedding-model noise:
+
+```powershell
+python scripts\benchmark_routing_hotpath.py `
+  --signatures ..\facets\signatures-data2k `
+  --anchor-facet coder `
+  --iterations 20 `
+  --warmup 1
+```
+
+The script reloads signatures independently for normal and `fullDepth` modes,
+reports cold and steady-state latency, and does not include embedding time.
 
 Short and large inputs share the same bounded semantic-unit pipeline. At most
 six units (global input plus domain-neutral clauses/chunks) are embedded in one

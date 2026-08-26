@@ -18,7 +18,12 @@ from lsr.models import LayeredSignature, SignatureLayer
 from lsr.routing import LSRRouter
 from lsr.registry import SignatureRegistry
 from lsr.server import LSRRequestHandler, LSRRouteService, extract_prompts
-from lsr.signatures import matrix_to_octets, octets_to_matrix
+from lsr.signatures import (
+    SignatureCodec,
+    decode_links,
+    matrix_to_octets,
+    octets_to_matrix,
+)
 
 
 class ResourceEfficiencyTests(unittest.TestCase):
@@ -146,6 +151,35 @@ class ResourceEfficiencyTests(unittest.TestCase):
 
         self.assertIn(1, first.layers)
         self.assertNotIn(1, second.layers)
+
+    def test_lazy_signature_reuses_immutable_link_topology_after_release(self) -> None:
+        parent_vectors = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+        child_vectors = np.asarray(
+            [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.2, 0.8]],
+            dtype=np.float32,
+        )
+        signature = LayeredSignature(
+            facet="facet",
+            dimension=2,
+            layers={
+                1: SignatureLayer(1, parent_vectors, [[0, 1], [2, 3]]),
+                2: SignatureLayer(2, child_vectors, []),
+            },
+        )
+        codec = SignatureCodec("test-model")
+        with tempfile.TemporaryDirectory() as directory:
+            path = codec.save(Path(directory) / "facet.sig", signature)
+            loaded = codec.load(path)
+            with patch("lsr.signatures.decode_links", wraps=decode_links) as decoder:
+                first = loaded.get_layer(1)
+                first_links = first.links
+                loaded.release_layer(1)
+                second = loaded.get_layer(1)
+
+        self.assertEqual(decoder.call_count, 1)
+        self.assertIs(second.links, first_links)
+        self.assertEqual([list(children) for children in second.links], [[0, 1], [2, 3]])
+        self.assertEqual(loaded.cached_topology_bytes(), 28)
 
     def test_explicitly_unloaded_facet_stays_disabled_during_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

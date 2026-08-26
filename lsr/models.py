@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from array import array
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +23,46 @@ class FacetSignature:
 class SignatureLayer:
     level: int
     vectors: Any
-    links: list[list[int]]
+    links: Sequence[Sequence[int]]
+
+
+@dataclass(frozen=True)
+class CompactLinks(Sequence[Sequence[int]]):
+    """Immutable CSR-style topology with four-byte parent/child offsets."""
+
+    offsets: array
+    children: array
+
+    @classmethod
+    def from_nested(cls, links: Sequence[Sequence[int]]) -> CompactLinks:
+        offsets = array("I", [0])
+        children = array("I")
+        for child_ids in links:
+            children.extend(int(child_id) for child_id in child_ids)
+            offsets.append(len(children))
+        return cls(offsets=offsets, children=children)
+
+    def __len__(self) -> int:
+        return max(0, len(self.offsets) - 1)
+
+    def __getitem__(self, index: int | slice) -> Sequence[int]:
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        position = int(index)
+        if position < 0:
+            position += len(self)
+        if position < 0 or position >= len(self):
+            raise IndexError(position)
+        start = int(self.offsets[position])
+        end = int(self.offsets[position + 1])
+        return memoryview(self.children)[start:end]
+
+    @property
+    def nbytes(self) -> int:
+        return (
+            len(self.offsets) * self.offsets.itemsize
+            + len(self.children) * self.children.itemsize
+        )
 
 
 @dataclass
@@ -36,6 +77,7 @@ class LayeredSignature:
     layer_sizes: dict[int, int] = field(default_factory=dict)
     layer_byte_sizes: dict[int, int] = field(default_factory=dict)
     layer_loader: Any = None
+    topology_cache: dict[int, CompactLinks] = field(default_factory=dict)
 
     def levels(self) -> list[int]:
         return sorted(self.layer_sizes or self.layers)
@@ -71,6 +113,9 @@ class LayeredSignature:
         vector_count = int(self.layer_sizes.get(level, 0))
         return vector_count * int(self.dimension) * 4
 
+    def cached_topology_bytes(self) -> int:
+        return sum(topology.nbytes for topology in self.topology_cache.values())
+
     def routing_copy(self) -> LayeredSignature:
         """Create request-local layer storage over immutable signature metadata."""
         return LayeredSignature(
@@ -87,6 +132,7 @@ class LayeredSignature:
             layer_sizes=dict(self.layer_sizes),
             layer_byte_sizes=dict(self.layer_byte_sizes),
             layer_loader=self.layer_loader,
+            topology_cache=self.topology_cache,
         )
 
 

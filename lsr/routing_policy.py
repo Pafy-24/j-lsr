@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from .dependencies import ensure_numpy
 
 
-def child_ids(links: list[list[int]], parent_ids: list[int], max_items: int | None = None) -> list[int]:
+def child_ids(
+    links: Sequence[Sequence[int]],
+    parent_ids: list[int],
+    max_items: int | None = None,
+) -> list[int]:
     ids: list[int] = []
     seen: set[int] = set()
     for parent_id in parent_ids:

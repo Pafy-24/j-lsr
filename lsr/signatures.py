@@ -12,7 +12,16 @@ from .dependencies import ensure_numpy, get_kmeans_class
 from .der import DerReader, der_integer, der_octet_string, der_sequence
 from .embedding import embed_texts, normalize_matrix, normalize_matrix_inplace
 from .errors import RouterError
-from .models import FacetSignature, LayeredSignature, RouteExample, SignatureLayer
+from .models import (
+    CompactLinks,
+    FacetSignature,
+    LayeredSignature,
+    RouteExample,
+    SignatureLayer,
+)
+
+
+_NO_CACHED_LINKS = object()
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,8 @@ class SignatureCodec:
         if not refs:
             raise RouterError(f"Signature does not contain any layers: {path}")
 
+        cached_links: dict[int, CompactLinks] = {}
+
         def load_layer(level: int) -> SignatureLayer:
             ref = refs.get(level)
             if ref is None:
@@ -227,7 +238,17 @@ class SignatureCodec:
             with ref.path.open("rb") as handle:
                 handle.seek(ref.start)
                 payload = handle.read(ref.end - ref.start)
-            return self.decode_layer(DerReader(payload), dimension)
+            cached = cached_links.get(level, _NO_CACHED_LINKS)
+            layer = self.decode_layer(
+                DerReader(payload),
+                dimension,
+                cached_links=cached,
+            )
+            if cached is _NO_CACHED_LINKS:
+                compact = CompactLinks.from_nested(layer.links)
+                cached_links[level] = compact
+                layer.links = compact
+            return layer
 
         return LayeredSignature(
             facet=path.stem.lower(),
@@ -240,6 +261,7 @@ class SignatureCodec:
             layer_sizes={level: ref.vector_count for level, ref in refs.items()},
             layer_byte_sizes={level: ref.encoded_bytes for level, ref in refs.items()},
             layer_loader=load_layer,
+            topology_cache=cached_links,
         )
 
     def encode_layer(self, layer: SignatureLayer) -> bytes:
@@ -251,13 +273,20 @@ class SignatureCodec:
             items.append(encode_links(layer.links))
         return der_sequence(*items)
 
-    def decode_layer(self, reader: DerReader, dimension: int) -> SignatureLayer:
+    def decode_layer(
+        self,
+        reader: DerReader,
+        dimension: int,
+        *,
+        cached_links: Any = _NO_CACHED_LINKS,
+    ) -> SignatureLayer:
         layer_reader = reader.read_sequence()
         level = layer_reader.read_integer()
         vectors = octets_to_matrix(layer_reader.read_octet_string(), dimension)
-        links: list[list[int]] = []
+        links: Any = [] if cached_links is _NO_CACHED_LINKS else cached_links
         if layer_reader.remaining():
-            links = decode_links(layer_reader)
+            if cached_links is _NO_CACHED_LINKS:
+                links = decode_links(layer_reader)
         return SignatureLayer(level=level, vectors=vectors, links=links)
 
     def decode_legacy_metadata(self, root: DerReader) -> dict[str, Any]:
@@ -395,12 +424,12 @@ def octets_to_matrix(payload: bytes, dimension: int) -> Any:
     return normalize_matrix_inplace(matrix)
 
 
-def encode_links(links: list[list[int]]) -> bytes:
+def encode_links(links: Any) -> bytes:
     return der_sequence(
         *[
             der_sequence(
                 der_integer(parent_id),
-                der_sequence(*(der_integer(child_id) for child_id in child_ids)),
+                der_sequence(*(der_integer(int(child_id)) for child_id in child_ids)),
             )
             for parent_id, child_ids in enumerate(links)
         ]

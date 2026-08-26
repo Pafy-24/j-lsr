@@ -304,6 +304,12 @@ class LSRRouter:
             for level, stats in sorted(self._memory_by_level.items())
         }
         peak = self._peak_resident_signature_bytes
+        topology_cache_bytes = sum(
+            signature.cached_topology_bytes() for signature in self.signatures.values()
+        )
+        topology_cache_levels = sum(
+            len(signature.topology_cache) for signature in self.signatures.values()
+        )
         facet_count = len(self.signatures)
         average_l1 = (all_l1 / facet_count) if facet_count else 0.0
         average_all = (eager_all / facet_count) if facet_count else 0.0
@@ -314,6 +320,9 @@ class LSRRouter:
             "allFacetL1Bytes": all_l1,
             "peakResidentVectorBytes": peak,
             "residentVectorBytesAfterRank": self._resident_signature_bytes,
+            "persistentTopologyCacheBytes": topology_cache_bytes,
+            "persistentTopologyCacheLevels": topology_cache_levels,
+            "peakResidentSignatureBytes": peak + topology_cache_bytes,
             "totalLayerBytesRead": self._total_layer_bytes_read,
             "layerLoadCount": self._layer_load_count,
             "avoidedPeakBytesVsEager": max(0, eager_all - peak),

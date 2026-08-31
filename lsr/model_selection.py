@@ -48,3 +48,22 @@ def validate_signature_model_compatibility(
             f"Loaded signatures for {', '.join(mismatched)} were created with a different model. "
             "Use --model auto or re-sign with the requested model."
         )
+
+
+def resolve_model_binding(
+    requested_model: str,
+    signatures: dict[str, LayeredSignature],
+    *,
+    model_identity: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the physical load path separately from signature identity.
+
+    RM mounts content-addressed artifacts at host-specific paths.  Signatures
+    must continue to validate against their portable model name while the
+    embedding runtime loads those exact bytes from the lease checkout.
+    """
+
+    identity = resolve_model_name(model_identity or requested_model, signatures)
+    validate_signature_model_compatibility(identity, signatures)
+    load_path = identity if requested_model == "auto" else requested_model
+    return load_path, identity

@@ -208,6 +208,7 @@ class RouterCLI:
             load_initial_signatures=not self.args.no_load,
             monitor_enabled=not self.args.no_monitor,
             workers=self.args.workers,
+            model_identity=self.args.model_identity,
         )
 
     def loadsig(self) -> None:

@@ -23,7 +23,7 @@ from .embedding import EmbeddingBatcher, load_model, model_tensor_bytes_by_devic
 from .errors import RouterError
 from .input_digest import prepare_routing_input
 from .memory import current_process_ram_bytes, current_vram_bytes, estimate_object_bytes
-from .model_selection import resolve_model_name, validate_signature_model_compatibility
+from .model_selection import resolve_model_binding, validate_signature_model_compatibility
 from .models import LayeredSignature
 from .monitor import ServerMonitor
 from .profiling import RankProfiler
@@ -46,6 +46,7 @@ class LSRRouteService:
         accept_threshold: float | None = None,
         load_initial_signatures: bool = True,
         monitor_enabled: bool = True,
+        model_identity: str | None = None,
     ):
         if default_top_k < 1:
             raise RouterError("--top-k must be at least 1.")
@@ -63,13 +64,16 @@ class LSRRouteService:
         self._last_signature_refresh = 0.0
         self.registry = SignatureRegistry(signatures_path)
         self.signatures: dict[str, LayeredSignature] = self.registry.signatures
-        self.model_name = model_name
+        self.model_name = model_identity or model_name
         if signatures_path and load_initial_signatures:
             self.load_signatures(signatures_path, required=True)
-        self.model_name = resolve_model_name(model_name, self.signatures)
-        validate_signature_model_compatibility(self.model_name, self.signatures)
+        self.model_load_path, self.model_name = resolve_model_binding(
+            model_name,
+            self.signatures,
+            model_identity=model_identity,
+        )
         ram_before_model = current_process_ram_bytes()
-        self.model = load_model(self.model_name, pu_index, online)
+        self.model = load_model(self.model_load_path, pu_index, online)
         self.embedding_batcher = EmbeddingBatcher(
             self.model,
             max_batch_units=DEFAULT_EMBEDDING_BATCH_MAX_UNITS,
@@ -131,14 +135,20 @@ class LSRRouteService:
             memory_callback=self._memory_event if memory_callback is None else memory_callback,
         )
 
-    def routing_router(self, top_k: int) -> LSRRouter:
+    def routing_router(
+        self, top_k: int, allowed_facets: list[str] | None = None
+    ) -> LSRRouter:
         """Build a request-local router from an atomic signature snapshot."""
+        allowed = set(allowed_facets) if allowed_facets is not None else None
         with self._state_lock:
             signatures = {
                 facet: signature.routing_copy()
                 for facet, signature in self.signatures.items()
+                if allowed is None or facet in allowed
             }
         if not signatures:
+            if allowed is not None:
+                raise RouterError("None of the allowed_facets are loaded.")
             raise RouterError("No signatures loaded. Use loadsig first.")
         route_id = next(self._route_ids)
 
@@ -218,6 +228,7 @@ class LSRRouteService:
             "service": "LSR",
             "model": self.model_name,
             "requested_model": self.requested_model_name,
+            "model_load_path": self.model_load_path,
             "index_policy": self.index_policy,
             "index_backend": router.index_backend_label(),
             "loading_policy": router.loading_policy_label(),
@@ -309,6 +320,7 @@ class LSRRouteService:
         top_k: int | None = None,
         full_depth: bool = False,
         large_input: str = "auto",
+        allowed_facets: list[str] | None = None,
     ) -> dict[str, Any]:
         profiler = RankProfiler()
         profiler.start()
@@ -317,7 +329,7 @@ class LSRRouteService:
             raise RouterError("Missing prompt.")
         self.refresh_signatures()
         active_top_k = self._top_k(top_k)
-        router = self.routing_router(active_top_k)
+        router = self.routing_router(active_top_k, allowed_facets)
         routing_input = prepare_routing_input(prompt, large_input)
         self._status("embedding", f"1 input on {getattr(self.model, 'device', 'selected PU')}")
         embedding_started = time.perf_counter()
@@ -333,6 +345,9 @@ class LSRRouteService:
         profiler.stage("routing", routing_started)
         attach_input_metadata(route, routing_input)
         response = json_ready_route(route)
+        response["candidateFacetFilter"] = candidate_facet_filter(
+            allowed_facets, router.signatures
+        )
         response["performance"] = profiler.finish()
         if self.monitor is not None:
             self.monitor.request_finished(
@@ -347,6 +362,7 @@ class LSRRouteService:
         top_k: int | None = None,
         full_depth: bool = False,
         large_input: str = "auto",
+        allowed_facets: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         started = time.perf_counter()
         cleaned = [prompt.strip() for prompt in prompts]
@@ -361,7 +377,7 @@ class LSRRouteService:
             if not prompt:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
-        router = self.routing_router(active_top_k)
+        router = self.routing_router(active_top_k, allowed_facets)
         routing_inputs = [prepare_routing_input(prompt, large_input) for prompt in cleaned]
         self._status("embedding", f"batch of {len(routing_inputs)} inputs")
         flat_units = [unit for item in routing_inputs for unit in item.routing_units]
@@ -378,7 +394,11 @@ class LSRRouteService:
             )
             offset += unit_count
             attach_input_metadata(route, routing_input)
-            routes.append(json_ready_route(route))
+            response = json_ready_route(route)
+            response["candidateFacetFilter"] = candidate_facet_filter(
+                allowed_facets, router.signatures
+            )
+            routes.append(response)
         if self.monitor is not None:
             self.monitor.request_finished((time.perf_counter() - started) * 1000.0)
         return routes
@@ -476,6 +496,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                     extract_top_k(payload),
                     extract_full_depth(payload),
                     extract_large_input(payload),
+                    extract_allowed_facets(payload),
                 )
             elif self.path == "/batch":
                 response = self.server.service.route_batch(
@@ -483,6 +504,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                     extract_top_k(payload),
                     extract_full_depth(payload),
                     extract_large_input(payload),
+                    extract_allowed_facets(payload),
                 )
             elif self.path == "/loadsig":
                 response = self.server.service.load_signatures(extract_signature_path(payload))
@@ -581,6 +603,32 @@ def extract_top_k(payload: Any) -> int | None:
         raise RouterError("top_k must be an integer.") from exc
 
 
+def extract_allowed_facets(payload: Any) -> list[str] | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("allowed_facets")
+    if value is None:
+        value = payload.get("allowedFacets")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise RouterError("allowed_facets must be a non-empty array of facet IDs.")
+    if len(value) > 1024:
+        raise RouterError("allowed_facets exceeds the 1024-item limit.")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise RouterError("Every allowed_facets item must be a string.")
+        facet = item.strip().lower()
+        if not facet or len(facet) > 256:
+            raise RouterError("Every allowed_facets item must contain 1-256 characters.")
+        if facet not in seen:
+            result.append(facet)
+            seen.add(facet)
+    return result
+
+
 def extract_full_depth(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -594,6 +642,26 @@ def extract_large_input(payload: Any) -> str:
     if mode not in {"auto", "off", "force"}:
         raise RouterError("large_input must be auto, off, or force.")
     return str(mode)
+
+
+def candidate_facet_filter(
+    requested: list[str] | None, effective_signatures: dict[str, Any]
+) -> dict[str, Any]:
+    effective = sorted(str(facet) for facet in effective_signatures)
+    if requested is None:
+        return {
+            "applied": False,
+            "requested": None,
+            "effective": effective,
+            "missing": [],
+        }
+    requested_set = set(requested)
+    return {
+        "applied": True,
+        "requested": list(requested),
+        "effective": effective,
+        "missing": sorted(requested_set.difference(effective)),
+    }
 
 
 def attach_input_metadata(route: dict[str, Any], routing_input: Any) -> None:
@@ -647,6 +715,7 @@ def serve(
     load_initial_signatures: bool = True,
     monitor_enabled: bool = True,
     workers: int = 4,
+    model_identity: str | None = None,
 ) -> None:
     service = LSRRouteService(
         signatures_path=signatures_path,
@@ -660,6 +729,7 @@ def serve(
         accept_threshold=accept_threshold,
         load_initial_signatures=load_initial_signatures,
         monitor_enabled=monitor_enabled,
+        model_identity=model_identity,
     )
     server = LSRHTTPServer((host, port), service, workers=workers)
     console.print(

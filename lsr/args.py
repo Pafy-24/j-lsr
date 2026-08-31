@@ -131,6 +131,13 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(serve)
     add_runtime_options(serve)
+    serve.add_argument(
+        "--model-identity",
+        help=(
+            "Portable model identity stored in signatures. Use this when --model "
+            "is an RM artifact path for the same immutable model."
+        ),
+    )
     add_index_option(serve)
     add_loading_policy_options(serve)
     serve.add_argument("--host", default=DEFAULT_SERVER_HOST, help=f"Host address. Default: {DEFAULT_SERVER_HOST}")

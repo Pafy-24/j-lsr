@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "jester-lsr"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26", "rich>=13"]
+dependencies = ["jester-rm-client>=0.1,<1", "numpy>=1.26", "rich>=13"]
 
 [project.optional-dependencies]
 semantic = ["sentence-transformers>=3", "scikit-learn>=1.4"]
@@ -19,3 +19,6 @@ jester-lsr = "lsr.commands:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+lsr = ["defaults.json"]

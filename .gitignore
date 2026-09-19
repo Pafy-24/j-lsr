@@ -26,6 +26,9 @@ quantized_info.csv
 .DS_Store
 Thumbs.db
 
+build/
+*.egg-info/
+
 .vscode/
 .idea/
 

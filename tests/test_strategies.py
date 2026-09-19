@@ -6,6 +6,7 @@ import os
 import numpy as np
 import pytest
 
+from lsr.errors import RouterError
 from lsr.models import LayeredSignature, SignatureLayer
 from lsr.registry import SignatureRegistry
 from lsr.routing import LSRRouter
@@ -163,9 +164,20 @@ def test_real_lazy_signature_owns_bytes_and_identity_survives_release_and_overwr
     original_stat = path.stat()
     codec.save(path, _signature("facet", [-1.0, 0.0]))
     os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    second = strategy.route("same", np.asarray([1.0, 0.0], dtype=np.float32))
-    assert first["selectedFacets"] == second["selectedFacets"]
+    with pytest.raises(RouterError, match="backing bytes changed"):
+        strategy.route("same", np.asarray([1.0, 0.0], dtype=np.float32))
     assert strategy.snapshot().identity == snapshot_id
+
+
+def test_lazy_codec_does_not_read_or_retain_the_whole_signature_file(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    path = codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    from unittest.mock import patch
+
+    with patch.object(path.__class__, "read_bytes", side_effect=AssertionError("whole-file read")):
+        loaded = codec.load(path)
+    assert loaded.layer_loader is not None
+    assert loaded.layer_digests
 
 
 def test_real_lazy_request_filters_are_isolated_concurrently(tmp_path) -> None:

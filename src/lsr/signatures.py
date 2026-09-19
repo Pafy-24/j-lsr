@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import math
 from dataclasses import dataclass
@@ -72,6 +71,40 @@ def read_exact(handle: BinaryIO, size: int) -> bytes:
     if len(payload) != size:
         raise RouterError("Unexpected end of DER data.")
     return payload
+
+
+def _hash_file_range(path: Path, start: int, end: int, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    remaining = end - start
+    if remaining < 0:
+        raise RouterError("Invalid signature layer range.")
+    with path.open("rb") as handle:
+        handle.seek(start)
+        while remaining:
+            chunk = handle.read(min(chunk_size, remaining))
+            if not chunk:
+                raise RouterError(f"Unexpected end of signature layer: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _read_hashed_file_range(path: Path, start: int, end: int, *, chunk_size: int = 1024 * 1024) -> tuple[bytes, str]:
+    digest = hashlib.sha256()
+    payload = bytearray()
+    remaining = end - start
+    if remaining < 0:
+        raise RouterError("Invalid signature layer range.")
+    with path.open("rb") as handle:
+        handle.seek(start)
+        while remaining:
+            chunk = handle.read(min(chunk_size, remaining))
+            if not chunk:
+                raise RouterError(f"Unexpected end of signature layer: {path}")
+            digest.update(chunk)
+            payload.extend(chunk)
+            remaining -= len(chunk)
+    return bytes(payload), digest.hexdigest()
 
 
 def read_tlv_header(
@@ -151,18 +184,15 @@ class SignatureCodec:
         return self.load_lazy(path)
 
     def load_lazy(self, path: Path) -> LayeredSignature:
-        # Own one immutable byte snapshot. Lazy reads must never reopen a
-        # mutable path after the registry has bound an asset to it.
-        source_bytes = path.read_bytes()
-        file_size = len(source_bytes)
+        file_size = path.stat().st_size
         if file_size == 0:
             raise RouterError(f"Empty signature file: {path}")
 
-        with io.BytesIO(source_bytes) as handle:
+        with path.open("rb") as handle:
             first = read_exact(handle, 1)
             if first != b"\x30":
                 handle.seek(0)
-                return self._load_legacy_json_signature(path, source_bytes)
+                return self._load_legacy_json_signature(path, handle.read())
 
             _, root_start, root_end, _ = read_tlv_header(handle, 0, file_size, 0x30)
             offset = root_start
@@ -234,16 +264,15 @@ class SignatureCodec:
             raise RouterError(f"Signature does not contain any layers: {path}")
 
         cached_links: dict[int, CompactLinks] = {}
-        layer_digests = {
-            level: hashlib.sha256(source_bytes[ref.start : ref.end]).hexdigest()
-            for level, ref in refs.items()
-        }
+        layer_digests = {level: _hash_file_range(ref.path, ref.start, ref.end) for level, ref in refs.items()}
 
         def load_layer(level: int) -> SignatureLayer:
             ref = refs.get(level)
             if ref is None:
                 raise RouterError(f"Signature {path} does not contain layer {level}.")
-            payload = source_bytes[ref.start : ref.end]
+            payload, encoded_sha256 = _read_hashed_file_range(ref.path, ref.start, ref.end)
+            if encoded_sha256 != layer_digests[level]:
+                raise RouterError(f"Signature backing bytes changed for {path} layer {level}.")
             cached = cached_links.get(level, _NO_CACHED_LINKS)
             layer = self.decode_layer(
                 DerReader(payload),

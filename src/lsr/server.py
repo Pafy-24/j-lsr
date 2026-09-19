@@ -21,6 +21,7 @@ from .config import (
 from .console import console
 from .embedding import EmbeddingBatcher, load_model, model_tensor_bytes_by_device
 from .errors import RouterError
+from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard
 from .input_digest import prepare_routing_input
 from .memory import current_process_ram_bytes, current_vram_bytes, estimate_object_bytes
 from .model_selection import resolve_model_binding, validate_signature_model_compatibility
@@ -443,9 +444,11 @@ class LSRRouteService:
 class LSRHTTPServer(HTTPServer):
     """HTTP server with a bounded worker pool instead of one thread per request."""
 
-    def __init__(self, address: tuple[str, int], service: LSRRouteService, workers: int = 4):
+    def __init__(self, address: tuple[str, int], service: LSRRouteService, workers: int = 4, *, managed_channel_guard: ManagedChannelGuard | None = None, require_managed_session: bool = False):
         super().__init__(address, LSRRequestHandler)
         self.service = service
+        self.managed_channel_guard = managed_channel_guard
+        self.require_managed_session = require_managed_session
         active_workers = max(1, workers)
         self.executor = ThreadPoolExecutor(
             max_workers=active_workers,
@@ -489,6 +492,12 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self.server.require_managed_session:
+                if self.path != "/route" or self.server.managed_channel_guard is None:
+                    raise ChannelSessionDenied("managed channel request is not authorized")
+                self.server.managed_channel_guard.authorize(
+                    self.headers, operation="lsr.route", method="POST"
+                )
             payload = self._read_json()
             if self.path in {"/route", "/rank"}:
                 response = self.server.service.route_one(
@@ -515,6 +524,8 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
                 return
             self._write_json(HTTPStatus.OK, response)
+        except ChannelSessionDenied:
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "managed channel session is not authorized"})
         except RouterError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except json.JSONDecodeError:

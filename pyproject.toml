@@ -6,7 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "jester-lsr"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["jester-rm-client>=0.1,<1", "numpy>=1.26", "rich>=13"]
+dependencies = [
+  "jester-core>=0.1,<1","jester-rm-client>=0.1,<1", "numpy>=1.26", "rich>=13"]
 
 [project.optional-dependencies]
 semantic = ["sentence-transformers>=3", "scikit-learn>=1.4"]

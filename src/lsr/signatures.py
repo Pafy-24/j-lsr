@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 from dataclasses import dataclass
@@ -150,15 +151,18 @@ class SignatureCodec:
         return self.load_lazy(path)
 
     def load_lazy(self, path: Path) -> LayeredSignature:
-        file_size = path.stat().st_size
+        # Own one immutable byte snapshot. Lazy reads must never reopen a
+        # mutable path after the registry has bound an asset to it.
+        source_bytes = path.read_bytes()
+        file_size = len(source_bytes)
         if file_size == 0:
             raise RouterError(f"Empty signature file: {path}")
 
-        with path.open("rb") as handle:
+        with io.BytesIO(source_bytes) as handle:
             first = read_exact(handle, 1)
             if first != b"\x30":
                 handle.seek(0)
-                return self._load_legacy_json_signature(path, handle.read())
+                return self._load_legacy_json_signature(path, source_bytes)
 
             _, root_start, root_end, _ = read_tlv_header(handle, 0, file_size, 0x30)
             offset = root_start
@@ -230,19 +234,22 @@ class SignatureCodec:
             raise RouterError(f"Signature does not contain any layers: {path}")
 
         cached_links: dict[int, CompactLinks] = {}
+        layer_digests = {
+            level: hashlib.sha256(source_bytes[ref.start : ref.end]).hexdigest()
+            for level, ref in refs.items()
+        }
 
         def load_layer(level: int) -> SignatureLayer:
             ref = refs.get(level)
             if ref is None:
                 raise RouterError(f"Signature {path} does not contain layer {level}.")
-            with ref.path.open("rb") as handle:
-                handle.seek(ref.start)
-                payload = handle.read(ref.end - ref.start)
+            payload = source_bytes[ref.start : ref.end]
             cached = cached_links.get(level, _NO_CACHED_LINKS)
             layer = self.decode_layer(
                 DerReader(payload),
                 dimension,
                 cached_links=cached,
+                readonly=True,
             )
             if cached is _NO_CACHED_LINKS:
                 compact = CompactLinks.from_nested(layer.links)
@@ -262,6 +269,7 @@ class SignatureCodec:
             layer_byte_sizes={level: ref.encoded_bytes for level, ref in refs.items()},
             layer_loader=load_layer,
             topology_cache=cached_links,
+            layer_digests=layer_digests,
         )
 
     def encode_layer(self, layer: SignatureLayer) -> bytes:
@@ -279,10 +287,13 @@ class SignatureCodec:
         dimension: int,
         *,
         cached_links: Any = _NO_CACHED_LINKS,
+        readonly: bool = False,
     ) -> SignatureLayer:
         layer_reader = reader.read_sequence()
         level = layer_reader.read_integer()
         vectors = octets_to_matrix(layer_reader.read_octet_string(), dimension)
+        if readonly:
+            vectors.setflags(write=False)
         links: Any = [] if cached_links is _NO_CACHED_LINKS else cached_links
         if layer_reader.remaining():
             if cached_links is _NO_CACHED_LINKS:
@@ -418,7 +429,7 @@ def octets_to_matrix(payload: bytes, dimension: int) -> Any:
     if len(payload) % row_size != 0:
         raise RouterError("Vector byte payload is not divisible by signature dimension.")
     raw_matrix = np.frombuffer(payload, dtype="<f4").reshape((-1, dimension))
-    # The byte buffer is immutable. Make exactly one native, writable copy and
+    # The byte buffer is immutable. Make exactly one native writable copy and
     # normalize it in place to avoid another full-size allocation per layer.
     matrix = np.array(raw_matrix, dtype=np.float32, order="C", copy=True)
     return normalize_matrix_inplace(matrix)

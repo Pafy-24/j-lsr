@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 import numpy as np
+import pytest
 
 from lsr.models import LayeredSignature, SignatureLayer
 from lsr.registry import SignatureRegistry
 from lsr.routing import LSRRouter
+from lsr.signatures import SignatureCodec
 from lsr.strategies import (
     FingerprintSpec,
     FingerprintGateSemanticStrategy,
@@ -120,11 +123,65 @@ def test_fingerprint_rejects_nonfinite_values() -> None:
         raise AssertionError("non-finite vectors must fail closed")
 
 
+def test_fingerprint_rejects_zero_norm_and_dimension_mismatch() -> None:
+    spec = FingerprintSpec()
+    with pytest.raises(ValueError, match="zero-norm"):
+        fingerprint_hex([0.0, 0.0], spec)
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        fingerprint_hex([1.0, 0.0, 0.0], spec, expected_dimension=2)
+
+
 def test_asset_identity_includes_complete_router_settings() -> None:
     registry, _ = _registry()
     first = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=1))
     second = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=9))
     assert first.asset.identity != second.asset.identity
+
+
+def test_strategy_rejects_router_mutation_after_asset_binding() -> None:
+    registry, router = _registry()
+    strategy = SemanticBaselineStrategy.build(registry, router)
+    router.top_k = 1
+    with pytest.raises(StrategyError, match="router settings changed"):
+        strategy.route("same", np.asarray([1.0, 0.0], dtype=np.float32))
+
+
+def test_real_lazy_signature_owns_bytes_and_identity_survives_release_and_overwrite(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    signature = _signature("facet", [1.0, 0.0])
+    path = codec.save(tmp_path / "facet.sig", signature)
+    registry = SignatureRegistry(path)
+    registry.load()
+    router = LSRRouter(registry.signatures, top_k=1)
+    strategy = SemanticBaselineStrategy.build(registry, router)
+    snapshot_id = strategy.asset.snapshot_id
+    loaded_layer = registry.signatures["facet"].get_layer(1)
+    with pytest.raises(ValueError):
+        loaded_layer.vectors[0, 0] = -1.0
+    registry.signatures["facet"].release_layer(1)
+    first = strategy.route("same", np.asarray([1.0, 0.0], dtype=np.float32))
+    original_stat = path.stat()
+    codec.save(path, _signature("facet", [-1.0, 0.0]))
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    second = strategy.route("same", np.asarray([1.0, 0.0], dtype=np.float32))
+    assert first["selectedFacets"] == second["selectedFacets"]
+    assert strategy.snapshot().identity == snapshot_id
+
+
+def test_real_lazy_request_filters_are_isolated_concurrently(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    codec.save(tmp_path / "first.sig", _signature("first", [1.0, 0.0]))
+    codec.save(tmp_path / "second.sig", _signature("second", [-1.0, 0.0]))
+    registry = SignatureRegistry(tmp_path)
+    registry.load()
+    strategy = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=1))
+    embedding = np.asarray([1.0, 0.0], dtype=np.float32)
+
+    def route(name: str) -> list[str]:
+        return [item["facet"] for item in strategy.route(name, embedding, candidate_facets=[name])["results"]]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(route, ["first", "second"])) == [["first"], ["second"]]
 
 
 def test_asset_loader_rejects_unknown_fields_and_algorithm() -> None:

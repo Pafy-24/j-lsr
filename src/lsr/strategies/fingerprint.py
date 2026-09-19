@@ -30,13 +30,17 @@ def _indices(seed: str, bit: int, dimension: int) -> tuple[int, int, int, int]:
     return tuple(int.from_bytes(digest[offset : offset + 4], "big") % dimension for offset in (0, 4, 8, 12))  # type: ignore[return-value]
 
 
-def fingerprint(values: Any, spec: FingerprintSpec) -> int:
+def fingerprint(values: Any, spec: FingerprintSpec, *, expected_dimension: int | None = None) -> int:
     array = np.asarray(values, dtype=np.float32)
     vector = np.mean(array, axis=0).reshape(-1) if array.ndim > 1 else array.reshape(-1)
     if vector.size == 0:
         raise ValueError("cannot fingerprint an empty vector")
     if not np.isfinite(vector).all():
         raise ValueError("cannot fingerprint non-finite values")
+    if expected_dimension is not None and vector.size != int(expected_dimension):
+        raise ValueError(f"fingerprint dimension mismatch: expected {expected_dimension}, got {vector.size}")
+    if float(np.linalg.norm(vector)) <= 0.0:
+        raise ValueError("cannot fingerprint a zero-norm vector")
     result = 0
     for bit in range(spec.bits):
         digest = hashlib.sha256(f"{spec.seed}:{bit}:signed".encode("utf-8")).digest()
@@ -48,9 +52,9 @@ def fingerprint(values: Any, spec: FingerprintSpec) -> int:
     return result
 
 
-def fingerprint_hex(values: Any, spec: FingerprintSpec) -> str:
+def fingerprint_hex(values: Any, spec: FingerprintSpec, *, expected_dimension: int | None = None) -> str:
     width = (spec.bits + 3) // 4
-    return f"{fingerprint(values, spec):0{width}x}"
+    return f"{fingerprint(values, spec, expected_dimension=expected_dimension):0{width}x}"
 
 
 def jaccard_hex(left: str, right: str, bits: int) -> float:
@@ -80,4 +84,4 @@ def signature_fingerprint(signature: Any, spec: FingerprintSpec) -> str:
     layer = local.get_layer(levels[0])
     vectors = np.asarray(layer.vectors, dtype=np.float32)
     prototype = np.mean(vectors, axis=0)
-    return fingerprint_hex(prototype, spec)
+    return fingerprint_hex(prototype, spec, expected_dimension=int(signature.dimension))

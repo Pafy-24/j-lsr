@@ -40,6 +40,7 @@ class Strategy:
         expected_router = asset.config.get("router")
         if expected_router != router_settings(router):
             raise StrategyError("strategy asset router settings differ from supplied router")
+        self._captured_router_settings = dict(expected_router)
         self._check_snapshot()
 
     @classmethod
@@ -50,6 +51,8 @@ class Strategy:
         return StrategyAsset.create(cls.strategy_id, cls.version, snapshot.identity, complete_config, fingerprints=fingerprints, created_at=created_at or utc_now())
 
     def _check_snapshot(self) -> RegistrySnapshot:
+        if router_settings(self.router) != self._captured_router_settings:
+            raise StrategyError("router settings changed after strategy asset binding")
         snapshot = self.registry.snapshot()
         if snapshot.identity != self.asset.snapshot_id:
             raise StrategyError("registry snapshot differs from strategy asset")

@@ -266,10 +266,14 @@ class SignatureRegistry:
 
 
 def _loaded_signature_digest(signature: LayeredSignature) -> str:
-    """Digest currently eager/in-memory vectors without rereading a backing file."""
+    """Digest immutable signature content, independent of lazy cache state."""
     digest = hashlib.sha256()
     digest.update(str(signature.facet).encode("utf-8"))
     digest.update(str(int(signature.dimension)).encode("ascii"))
+    if signature.layer_digests:
+        for level, layer_digest in sorted(signature.layer_digests.items()):
+            digest.update(f"layer:{int(level)}:{layer_digest}".encode("ascii"))
+        return digest.hexdigest()
     for level in signature.levels():
         layer = signature.layers.get(level)
         if layer is None:

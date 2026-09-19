@@ -78,6 +78,10 @@ class LayeredSignature:
     layer_byte_sizes: dict[int, int] = field(default_factory=dict)
     layer_loader: Any = None
     topology_cache: dict[int, CompactLinks] = field(default_factory=dict)
+    # For lazy signatures these are digests of the immutable encoded layer
+    # bytes captured at load time. They make registry identity independent of
+    # the current cache (loaded or released).
+    layer_digests: dict[int, str] = field(default_factory=dict)
 
     def levels(self) -> list[int]:
         return sorted(self.layer_sizes or self.layers)
@@ -133,6 +137,7 @@ class LayeredSignature:
             layer_byte_sizes=dict(self.layer_byte_sizes),
             layer_loader=self.layer_loader,
             topology_cache=self.topology_cache,
+            layer_digests=dict(self.layer_digests),
         )
 
 

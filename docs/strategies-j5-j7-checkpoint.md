@@ -16,6 +16,11 @@ identity. Mutating loaded vectors therefore changes the identity; snapshot
 capture does not reread the backing file on every request. A loaded asset
 refuses to route against a different snapshot.
 
+Lazy `.sig` loads own the source bytes for their lifetime and decode layers
+from that immutable buffer. Cache loading and release do not change semantic
+identity, and a later overwrite of the original path cannot change an already
+bound asset.
+
 The strategy surface is:
 
 - `build(registry, router)` creates an asset from the actual loaded registry;
@@ -44,7 +49,10 @@ rejected.
 
 Fingerprints record algorithm, bit count, seed, and feature configuration in
 the asset. They are an experimental deterministic prefilter, not a semantic
-quality claim.
+quality claim. Fingerprint assets also bind the registry dimension; non-finite,
+zero-norm, and dimension-mismatched query vectors are rejected. Router settings
+are checked again at operation time so mutating a router after asset creation
+cannot silently change the bound behavior.
 
 ## Evaluation boundary
 

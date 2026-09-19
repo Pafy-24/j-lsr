@@ -84,7 +84,8 @@ class RegistrySnapshot:
         """Return a request-local intersection without changing the snapshot."""
         if requested is None:
             return self.facets
-        allowed = frozenset(str(value).strip().lower() for value in requested if str(value).strip())
+        values = [requested] if isinstance(requested, str) else requested
+        allowed = frozenset(str(value).strip().lower() for value in values if str(value).strip())
         return tuple(facet for facet in self.facets if facet in allowed)
 
     def to_dict(self) -> dict[str, Any]:

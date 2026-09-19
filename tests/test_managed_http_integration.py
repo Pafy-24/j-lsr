@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+import pytest
+
+if os.environ.get("JESTER_CROSS_REPO_TESTS") != "1":
+    pytest.skip("cross-repo RM/component integration; set JESTER_CROSS_REPO_TESTS=1", allow_module_level=True)
+
 import json
 import os
 import sys

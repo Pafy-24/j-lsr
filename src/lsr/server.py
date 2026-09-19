@@ -21,7 +21,7 @@ from .config import (
 from .console import console
 from .embedding import EmbeddingBatcher, load_model, model_tensor_bytes_by_device
 from .errors import RouterError
-from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard
+from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard, guard_from_managed_environment
 from .input_digest import prepare_routing_input
 from .memory import current_process_ram_bytes, current_vram_bytes, estimate_object_bytes
 from .model_selection import resolve_model_binding, validate_signature_model_compatibility
@@ -493,7 +493,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             if self.server.require_managed_session:
-                if self.path != "/route" or self.server.managed_channel_guard is None:
+                if self.path not in {"/route", "/rank"} or self.server.managed_channel_guard is None:
                     raise ChannelSessionDenied("managed channel request is not authorized")
                 self.server.managed_channel_guard.authorize(
                     self.headers, operation="lsr.route", method="POST"
@@ -742,7 +742,13 @@ def serve(
         monitor_enabled=monitor_enabled,
         model_identity=model_identity,
     )
-    server = LSRHTTPServer((host, port), service, workers=workers)
+    managed = os.environ.get("JESTER_RM_REQUIRED", "").lower() in {"1", "true", "yes", "on"}
+    try:
+        guard = guard_from_managed_environment() if managed else None
+    except ChannelSessionDenied as exc:
+        service.close()
+        raise RouterError("managed channel context is required") from exc
+    server = LSRHTTPServer((host, port), service, workers=workers, managed_channel_guard=guard, require_managed_session=managed)
     console.print(
         f"LSR server ready on http://{host}:{port} "
         f"with facets: {', '.join(service.health()['facets']) or 'none'}"

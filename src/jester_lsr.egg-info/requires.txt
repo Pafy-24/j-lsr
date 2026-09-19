@@ -1,0 +1,15 @@
+numpy>=1.26
+rich>=13
+
+[faiss]
+faiss-cpu>=1.8
+
+[semantic]
+sentence-transformers>=3
+scikit-learn>=1.4
+
+[test]
+pytest>=8
+
+[windows-ml]
+onnxruntime-windowsml

@@ -1,0 +1,2 @@
+[console_scripts]
+jester-lsr = lsr.commands:main

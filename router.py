@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+"""Compatibility wrapper; installed users should invoke `jester-lsr`."""
 from lsr.args import parse_args
 from lsr.commands import (
     RouterCLI,

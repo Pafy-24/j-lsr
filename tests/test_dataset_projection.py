@@ -5,12 +5,32 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lsr.dataset_schema import load_lsr_dataset
+from lsr.commands import load_benchmark_items
+from lsr.dataset_schema import load_legacy_benchmark_items, load_lsr_dataset
+from lsr.errors import RouterError
 from lsr.routing_context import agent_event_to_text, facet_record_to_routing_text
 from lsr.server import extract_prompt
 
 
 class DatasetProjectionTests(unittest.TestCase):
+    def test_benchmark_empty_route_and_normal_labels_remain_distinct(self) -> None:
+        raw = json.dumps(
+            [
+                {"input": "Base-only request", "expectedFacets": []},
+                {"input": "Python request", "expectedFacets": [" Coder ", "coder.python"]},
+            ]
+        )
+
+        expected = [[], ["coder", "coder.python"]]
+        self.assertEqual(load_legacy_benchmark_items(raw)[1], expected)
+        self.assertEqual(load_benchmark_items(raw)[1], expected)
+
+    def test_benchmark_missing_or_blank_label_is_invalid(self) -> None:
+        with self.assertRaisesRegex(RouterError, "no expected facet"):
+            load_legacy_benchmark_items(json.dumps([{"input": "Unlabeled"}]))
+        with self.assertRaisesRegex(RouterError, "invalid expected facet"):
+            load_legacy_benchmark_items(json.dumps([{"input": "Blank", "expectedFacets": "  "}]))
+
     def test_canonical_record_uses_training_input_without_target_or_labels(self) -> None:
         record = {
             "schemaVersion": "facet-record-v3",

@@ -10,7 +10,7 @@ from typing import Any
 from .args import parse_args
 from .console import console, error_console
 from .dataset import grouped_examples, infer_facet_from_paths
-from .dataset_schema import items_to_examples, load_labeled_prompts, load_lsr_dataset
+from .dataset_schema import benchmark_expected_facets, items_to_examples, load_labeled_prompts, load_lsr_dataset
 from .dependencies import make_ascii_table, make_table
 from .devices import print_processing_units, select_processing_unit
 from .embedding import embed_texts, load_model
@@ -694,22 +694,10 @@ def load_benchmark_items(raw: str) -> tuple[list[str], list[list[str]]]:
         prompt = item.get("input") or item.get("prompt") or item.get("text")
         if prompt is None and isinstance(item.get("texts"), list):
             prompt = "\n".join(str(text) for text in item["texts"])
-        expected_facets = (
-            item.get("expectedFacets")
-            or item.get("expected_facets")
-            or item.get("expected")
-            or item.get("facet")
-        )
         if not isinstance(prompt, str) or not prompt.strip():
             raise RouterError(f"Benchmark item {index} has no prompt text.")
-        if isinstance(expected_facets, str):
-            expected_list = [expected_facets]
-        elif isinstance(expected_facets, list) and all(isinstance(facet, str) for facet in expected_facets):
-            expected_list = expected_facets
-        else:
-            raise RouterError(f"Benchmark item {index} has no expected facet.")
         prompts.append(prompt.strip())
-        expected.append([facet.strip().lower() for facet in expected_list if facet.strip()])
+        expected.append(benchmark_expected_facets(item, index))
     return prompts, expected
 
 

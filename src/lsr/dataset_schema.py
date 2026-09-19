@@ -303,17 +303,34 @@ def load_legacy_benchmark_items(raw: str) -> tuple[list[str], list[list[str]]]:
         prompt = item.get("input") or item.get("prompt") or item.get("text")
         if prompt is None and isinstance(item.get("texts"), list):
             prompt = "\n".join(str(text) for text in item["texts"])
-        expected_facets = (
-            item.get("expectedFacets")
-            or item.get("expected_facets")
-            or item.get("expected")
-            or item.get("facet")
-        )
         if not isinstance(prompt, str) or not prompt.strip():
             raise RouterError(f"Benchmark item {index} has no prompt text.")
         prompts.append(prompt.strip())
-        expected.append(normalize_expected_facets(expected_facets, ""))
+        expected.append(benchmark_expected_facets(item, index))
     return prompts, expected
+
+
+def benchmark_expected_facets(item: dict[str, Any], index: int) -> list[str]:
+    """Read benchmark labels without conflating abstention and absent labels.
+
+    An explicitly empty list means a base-only/abstention example. A missing,
+    blank, or malformed label is invalid input and must not silently turn into
+    an empty-string facet.
+    """
+    for field in ("expectedFacets", "expected_facets", "expected", "facet"):
+        if field not in item:
+            continue
+        value = item[field]
+        if isinstance(value, str):
+            label = value.strip().lower()
+            if label:
+                return [label]
+        elif isinstance(value, list):
+            if not all(isinstance(label, str) and label.strip() for label in value):
+                raise RouterError(f"Benchmark item {index} has an invalid expected facet.")
+            return [label.strip().lower() for label in value]
+        raise RouterError(f"Benchmark item {index} has an invalid expected facet.")
+    raise RouterError(f"Benchmark item {index} has no expected facet.")
 
 
 def write_stage_jsonl(path: str | Path, items: list[LSRDatasetItem]) -> None:

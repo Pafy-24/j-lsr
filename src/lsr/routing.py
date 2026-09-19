@@ -176,6 +176,22 @@ class LSRRouter:
         self.index_backends.clear()
         self.index_backends.add("streaming-flat")
 
+    def request_router(self, signatures: dict[str, LayeredSignature]) -> "LSRRouter":
+        """Create a request-local router with this router's semantic settings."""
+        return LSRRouter(
+            signatures,
+            top_k=self.top_k,
+            index_policy=self.index_policy,
+            model_name=self.model_name,
+            memory_limit_mb=self.memory_limit_mb,
+            descend_threshold=self.descend_threshold,
+            accept_threshold=self.accept_threshold,
+            full_depth=self.full_depth,
+            cache_policy=self.cache_policy,
+            status_callback=self.status_callback,
+            memory_callback=self.memory_callback,
+        )
+
     def index_backend_label(self) -> str:
         if not self.index_backends:
             return "none"

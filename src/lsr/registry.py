@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,75 @@ class SignatureFileState:
     layer_sizes: dict[int, int]
     loaded_layers: list[int]
     loaded_vector_bytes: int
+
+
+@dataclass(frozen=True)
+class SignatureSnapshot:
+    """Portable identity metadata for one loaded signature."""
+
+    facet: str
+    path: str
+    content_sha256: str
+    size: int
+    model_name: str
+    model_hash: str
+    dimension: int
+    normalize: bool
+    distance_metric: str
+    layer_sizes: tuple[tuple[int, int], ...]
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "facet": self.facet,
+            "contentSha256": self.content_sha256,
+            "size": self.size,
+            "modelName": self.model_name,
+            "modelHash": self.model_hash,
+            "dimension": self.dimension,
+            "normalize": self.normalize,
+            "distanceMetric": self.distance_metric,
+            "layerSizes": [[level, count] for level, count in self.layer_sizes],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        value = self.identity_payload()
+        value["path"] = self.path
+        return value
+
+
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    """Immutable, content-addressed view of a loaded signature registry."""
+
+    schema_version: str
+    entries: tuple[SignatureSnapshot, ...]
+
+    @property
+    def facets(self) -> tuple[str, ...]:
+        return tuple(entry.facet for entry in self.entries)
+
+    @property
+    def identity(self) -> str:
+        payload = {
+            "schemaVersion": self.schema_version,
+            "entries": [entry.identity_payload() for entry in self.entries],
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def candidate_facets(self, requested: Any = None) -> tuple[str, ...]:
+        """Return a request-local intersection without changing the snapshot."""
+        if requested is None:
+            return self.facets
+        allowed = frozenset(str(value).strip().lower() for value in requested if str(value).strip())
+        return tuple(facet for facet in self.facets if facet in allowed)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "snapshotId": self.identity,
+            "facets": [entry.to_dict() for entry in self.entries],
+        }
 
 
 class SignatureRegistry:
@@ -143,3 +214,42 @@ class SignatureRegistry:
             }
             for state in self.state()
         }
+
+    def snapshot(self) -> RegistrySnapshot:
+        """Capture loaded signatures without exposing mutable registry state."""
+        entries: list[SignatureSnapshot] = []
+        for facet, signature in sorted(self.signatures.items()):
+            path = self.files.get(facet)
+            resolved_path = str(path.resolve()) if path is not None else ""
+            if path is not None and path.exists() and path.is_file():
+                payload = path.read_bytes()
+                content_sha256 = hashlib.sha256(payload).hexdigest()
+                size = len(payload)
+            else:
+                metadata = {
+                    "facet": signature.facet,
+                    "dimension": signature.dimension,
+                    "modelName": signature.model_name,
+                    "modelHash": signature.model_hash.hex(),
+                    "normalize": signature.normalize,
+                    "distanceMetric": signature.distance_metric,
+                    "layerSizes": sorted((int(level), int(count)) for level, count in signature.layer_sizes.items()),
+                }
+                encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                content_sha256 = hashlib.sha256(encoded).hexdigest()
+                size = len(encoded)
+            entries.append(
+                SignatureSnapshot(
+                    facet=signature.facet,
+                    path=resolved_path,
+                    content_sha256=content_sha256,
+                    size=size,
+                    model_name=signature.model_name,
+                    model_hash=signature.model_hash.hex(),
+                    dimension=int(signature.dimension),
+                    normalize=bool(signature.normalize),
+                    distance_metric=signature.distance_metric,
+                    layer_sizes=tuple(sorted((int(level), int(count)) for level, count in signature.layer_sizes.items())),
+                )
+            )
+        return RegistrySnapshot(schema_version="lsr-registry-snapshot-v1", entries=tuple(entries))

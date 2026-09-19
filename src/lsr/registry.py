@@ -33,6 +33,7 @@ class SignatureSnapshot:
     facet: str
     path: str
     content_sha256: str
+    loaded_sha256: str
     size: int
     model_name: str
     model_hash: str
@@ -45,6 +46,7 @@ class SignatureSnapshot:
         return {
             "facet": self.facet,
             "contentSha256": self.content_sha256,
+            "loadedSha256": self.loaded_sha256,
             "size": self.size,
             "modelName": self.model_name,
             "modelHash": self.model_hash,
@@ -103,6 +105,7 @@ class SignatureRegistry:
         self.signatures: dict[str, LayeredSignature] = {}
         self.files: dict[str, Path] = {}
         self.file_stats: dict[str, tuple[float, int]] = {}
+        self.file_digests: dict[str, str] = {}
         self.stale_signatures: list[str] = []
         self.disabled_facets: set[str] = set()
 
@@ -110,6 +113,7 @@ class SignatureRegistry:
         self.signatures.clear()
         self.files.clear()
         self.file_stats.clear()
+        self.file_digests.clear()
         self.disabled_facets.clear()
         for file_path in self.signature_files(required):
             self.load_file(file_path)
@@ -149,6 +153,7 @@ class SignatureRegistry:
         self.signatures.pop(key, None)
         self.files.pop(key, None)
         self.file_stats.pop(key, None)
+        self.file_digests.pop(key, None)
         if disable:
             self.disabled_facets.add(key)
 
@@ -158,6 +163,7 @@ class SignatureRegistry:
         self.signatures[signature.facet] = signature
         self.files[signature.facet] = file_path
         self.file_stats[signature.facet] = (stat.st_mtime, stat.st_size)
+        self.file_digests[signature.facet] = hashlib.sha256(file_path.read_bytes()).hexdigest()
         self.disabled_facets.discard(signature.facet)
         return signature
 
@@ -223,9 +229,10 @@ class SignatureRegistry:
             path = self.files.get(facet)
             resolved_path = str(path.resolve()) if path is not None else ""
             if path is not None and path.exists() and path.is_file():
-                payload = path.read_bytes()
-                content_sha256 = hashlib.sha256(payload).hexdigest()
-                size = len(payload)
+                if facet not in self.file_digests:
+                    self.file_digests[facet] = hashlib.sha256(path.read_bytes()).hexdigest()
+                content_sha256 = self.file_digests[facet]
+                size = int(self.file_stats.get(facet, (0.0, path.stat().st_size))[1])
             else:
                 metadata = {
                     "facet": signature.facet,
@@ -239,11 +246,13 @@ class SignatureRegistry:
                 encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 content_sha256 = hashlib.sha256(encoded).hexdigest()
                 size = len(encoded)
+            loaded_sha256 = _loaded_signature_digest(signature)
             entries.append(
                 SignatureSnapshot(
                     facet=signature.facet,
                     path=resolved_path,
                     content_sha256=content_sha256,
+                    loaded_sha256=loaded_sha256,
                     size=size,
                     model_name=signature.model_name,
                     model_hash=signature.model_hash.hex(),
@@ -254,3 +263,27 @@ class SignatureRegistry:
                 )
             )
         return RegistrySnapshot(schema_version="lsr-registry-snapshot-v1", entries=tuple(entries))
+
+
+def _loaded_signature_digest(signature: LayeredSignature) -> str:
+    """Digest currently eager/in-memory vectors without rereading a backing file."""
+    digest = hashlib.sha256()
+    digest.update(str(signature.facet).encode("utf-8"))
+    digest.update(str(int(signature.dimension)).encode("ascii"))
+    for level in signature.levels():
+        layer = signature.layers.get(level)
+        if layer is None:
+            digest.update(f"unloaded:{level}".encode("ascii"))
+            continue
+        digest.update(f"level:{level}".encode("ascii"))
+        try:
+            import numpy as np
+
+            vectors = np.asarray(layer.vectors, dtype=np.float32)
+            digest.update(repr(vectors.shape).encode("ascii"))
+            digest.update(vectors.tobytes(order="C"))
+        except Exception:
+            digest.update(repr(layer.vectors).encode("utf-8"))
+        for links in layer.links:
+            digest.update(json.dumps([int(value) for value in links], separators=(",", ":")).encode("ascii"))
+    return digest.hexdigest()

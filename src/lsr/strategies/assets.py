@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +12,8 @@ from typing import Any, Mapping
 
 
 ASSET_SCHEMA_VERSION = "lsr-strategy-asset-v1"
+KNOWN_STRATEGIES = {"semantic-baseline-v1", "fingerprint-only-v1", "fingerprint-gate-semantic-v1"}
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class StrategyError(ValueError):
@@ -17,7 +21,23 @@ class StrategyError(ValueError):
 
 
 def canonical_json(value: Any) -> str:
+    _validate_json_value(value, "config")
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _validate_json_value(value: Any, path: str) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise StrategyError(f"non-finite asset value at {path}")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise StrategyError(f"asset object key at {path} is not a string")
+            _validate_json_value(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _validate_json_value(child, f"{path}[{index}]")
+    elif value is not None and not isinstance(value, (str, int, bool, float)):
+        raise StrategyError(f"unsupported asset value at {path}")
 
 
 @dataclass(frozen=True)
@@ -41,6 +61,16 @@ class StrategyAsset:
         fingerprints: Mapping[str, str] | None = None,
         created_at: str = "",
     ) -> "StrategyAsset":
+        if strategy_id not in KNOWN_STRATEGIES:
+            raise StrategyError(f"unknown strategy asset: {strategy_id}")
+        if not version:
+            raise StrategyError("strategy asset version is required")
+        if not HEX64.fullmatch(str(snapshot_id)):
+            raise StrategyError("strategy asset snapshot_id must be a lowercase SHA-256")
+        if fingerprints is not None:
+            for facet, value in fingerprints.items():
+                if not str(facet).strip() or not re.fullmatch(r"[0-9a-f]+", str(value)):
+                    raise StrategyError("malformed facet fingerprint")
         return cls(
             schema_version=ASSET_SCHEMA_VERSION,
             strategy_id=str(strategy_id),
@@ -82,18 +112,35 @@ class StrategyAsset:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "StrategyAsset":
+        required = {"schemaVersion", "strategyId", "version", "snapshotId", "config", "fingerprints", "createdAt", "assetId"}
+        unknown = set(value) - required
+        if unknown:
+            raise StrategyError(f"unknown strategy asset fields: {sorted(unknown)}")
+        if set(value) != required:
+            raise StrategyError("strategy asset has missing required fields")
         if str(value.get("schemaVersion") or "") != ASSET_SCHEMA_VERSION:
             raise StrategyError("unsupported strategy asset schema")
-        fingerprints = value.get("fingerprints") or []
+        if not isinstance(value.get("config"), dict) or not isinstance(value.get("fingerprints"), list):
+            raise StrategyError("strategy asset config/fingerprints have invalid types")
+        config = value["config"]
+        algorithm = config.get("algorithm")
+        if algorithm is not None and algorithm != "signed-feature-hash-jaccard-v2":
+            raise StrategyError("unsupported fingerprint algorithm")
+        fingerprints = value["fingerprints"]
+        parsed_fingerprints: dict[str, str] = {}
+        for item in fingerprints:
+            if not isinstance(item, list) or len(item) != 2 or not all(isinstance(part, str) for part in item):
+                raise StrategyError("strategy asset fingerprint entry is malformed")
+            if item[0] in parsed_fingerprints:
+                raise StrategyError("strategy asset contains duplicate fingerprint facet")
+            parsed_fingerprints[item[0]] = item[1]
+        if not isinstance(value.get("createdAt"), str) or not isinstance(value.get("assetId"), str):
+            raise StrategyError("strategy asset createdAt/assetId must be strings")
         asset = cls.create(
-            str(value.get("strategyId") or ""),
-            str(value.get("version") or ""),
-            str(value.get("snapshotId") or ""),
-            value.get("config") if isinstance(value.get("config"), dict) else {},
-            fingerprints={str(item[0]): str(item[1]) for item in fingerprints if isinstance(item, list) and len(item) == 2},
-            created_at=str(value.get("createdAt") or ""),
+            value["strategyId"], value["version"], value["snapshotId"], config,
+            fingerprints=parsed_fingerprints, created_at=value["createdAt"],
         )
-        expected = str(value.get("assetId") or "")
+        expected = value["assetId"]
         if expected != asset.identity:
             raise StrategyError("strategy asset identity digest mismatch")
         return asset

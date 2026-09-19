@@ -9,13 +9,17 @@ import numpy as np
 
 @dataclass(frozen=True)
 class FingerprintSpec:
-    algorithm: str = "signed-feature-hash-jaccard-v1"
+    algorithm: str = "signed-feature-hash-jaccard-v2"
     bits: int = 128
     seed: str = "jester-lsr-j5"
 
     def __post_init__(self) -> None:
-        if self.bits < 8 or self.bits > 4096:
+        if self.algorithm != "signed-feature-hash-jaccard-v2":
+            raise ValueError("unsupported fingerprint algorithm")
+        if isinstance(self.bits, bool) or self.bits < 8 or self.bits > 4096 or self.bits % 8:
             raise ValueError("fingerprint bits must be between 8 and 4096")
+        if not self.seed:
+            raise ValueError("fingerprint seed is required")
 
     def to_dict(self) -> dict[str, Any]:
         return {"algorithm": self.algorithm, "bits": self.bits, "seed": self.seed}
@@ -31,10 +35,14 @@ def fingerprint(values: Any, spec: FingerprintSpec) -> int:
     vector = np.mean(array, axis=0).reshape(-1) if array.ndim > 1 else array.reshape(-1)
     if vector.size == 0:
         raise ValueError("cannot fingerprint an empty vector")
+    if not np.isfinite(vector).all():
+        raise ValueError("cannot fingerprint non-finite values")
     result = 0
     for bit in range(spec.bits):
+        digest = hashlib.sha256(f"{spec.seed}:{bit}:signed".encode("utf-8")).digest()
         indices = _indices(spec.seed, bit, vector.size)
-        feature = float(np.mean(vector[list(indices)]))
+        signs = tuple(1.0 if digest[offset] & 1 else -1.0 for offset in (16, 17, 18, 19))
+        feature = float(np.mean([vector[index] * sign for index, sign in zip(indices, signs)]))
         if feature >= 0.0:
             result |= 1 << bit
     return result
@@ -46,11 +54,21 @@ def fingerprint_hex(values: Any, spec: FingerprintSpec) -> str:
 
 
 def jaccard_hex(left: str, right: str, bits: int) -> float:
-    left_value = int(left, 16)
-    right_value = int(right, 16)
+    if isinstance(bits, bool) or bits < 8 or bits > 4096 or bits % 8:
+        raise ValueError("fingerprint bits must be between 8 and 4096")
+    width = bits // 4
+    if not isinstance(left, str) or not isinstance(right, str):
+        raise ValueError("fingerprints must be hexadecimal strings")
+    if len(left) != width or len(right) != width:
+        raise ValueError("fingerprint length does not match configured bits")
+    try:
+        left_value = int(left, 16)
+        right_value = int(right, 16)
+    except ValueError as error:
+        raise ValueError("fingerprints must be hexadecimal strings") from error
     union = (left_value | right_value).bit_count()
     if union == 0:
-        return 1.0
+        return 1.0 if left_value == right_value == 0 else 0.0
     return (left_value & right_value).bit_count() / union
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable
 
 from ..registry import SignatureRegistry
@@ -13,9 +14,14 @@ class SemanticBaselineStrategy(Strategy):
     strategy_id = "semantic-baseline-v1"
     version = "1"
 
+    def __init__(self, registry: SignatureRegistry, router: LSRRouter, asset: StrategyAsset):
+        super().__init__(registry, router, asset)
+        if set(asset.config) != {"mode", "router"} or asset.config.get("mode") != "existing-semantic-router":
+            raise StrategyError("baseline asset has missing or unknown config fields")
+
     @classmethod
     def build(cls, registry: SignatureRegistry, router: LSRRouter) -> "SemanticBaselineStrategy":
-        return cls(registry, router, cls._make_asset(registry, {"mode": "existing-semantic-router"}))
+        return cls(registry, router, cls._make_asset(registry, router, {"mode": "existing-semantic-router"}))
 
 
 class FingerprintOnlyStrategy(Strategy):
@@ -25,14 +31,26 @@ class FingerprintOnlyStrategy(Strategy):
     def __init__(self, registry: SignatureRegistry, router: LSRRouter, asset: StrategyAsset):
         super().__init__(registry, router, asset)
         config = asset.config
-        self.spec = FingerprintSpec(str(config.get("algorithm", "signed-feature-hash-jaccard-v1")), int(config.get("bits", 128)), str(config.get("seed", "jester-lsr-j5")))
-        self.minimum_jaccard = float(config.get("minimumJaccard", 0.5))
+        allowed = {"algorithm", "bits", "seed", "minimumJaccard", "router"}
+        if self.strategy_id == "fingerprint-gate-semantic-v1":
+            allowed.add("mode")
+        if set(config) != allowed or (self.strategy_id == "fingerprint-gate-semantic-v1" and config.get("mode") != "fingerprint-gate-then-semantic"):
+            raise StrategyError("fingerprint-only asset has missing or unknown config fields")
+        if not isinstance(config["bits"], int) or isinstance(config["bits"], bool) or not isinstance(config["seed"], str) or not isinstance(config["minimumJaccard"], (int, float)) or isinstance(config["minimumJaccard"], bool) or not math.isfinite(float(config["minimumJaccard"])) or not 0.0 <= float(config["minimumJaccard"]) <= 1.0:
+            raise StrategyError("invalid fingerprint-only configuration")
+        self.spec = FingerprintSpec(str(config["algorithm"]), config["bits"], config["seed"])
+        self.minimum_jaccard = float(config["minimumJaccard"])
+        if set(self.asset.fingerprint_map) != set(self.snapshot().facets):
+            raise StrategyError("fingerprint asset facets differ from registry snapshot")
+        width = self.spec.bits // 4
+        if any(len(value) != width or any(char not in "0123456789abcdef" for char in value) for value in self.asset.fingerprint_map.values()):
+            raise StrategyError("fingerprint asset value does not match configured bits")
 
     @classmethod
     def build(cls, registry: SignatureRegistry, router: LSRRouter, *, bits: int = 128, seed: str = "jester-lsr-j5", minimum_jaccard: float = 0.5) -> "FingerprintOnlyStrategy":
         spec = FingerprintSpec(bits=bits, seed=seed)
         fingerprints = {facet: signature_fingerprint(registry.signatures[facet], spec) for facet in registry.snapshot().facets}
-        asset = cls._make_asset(registry, {"algorithm": spec.algorithm, "bits": bits, "seed": seed, "minimumJaccard": minimum_jaccard}, fingerprints=fingerprints)
+        asset = cls._make_asset(registry, router, {"algorithm": spec.algorithm, "bits": bits, "seed": seed, "minimumJaccard": minimum_jaccard}, fingerprints=fingerprints)
         return cls(registry, router, asset)
 
     def _scores(self, prompt_embedding: Any, names: tuple[str, ...]) -> dict[str, float]:
@@ -71,8 +89,14 @@ class FingerprintGateSemanticStrategy(FingerprintOnlyStrategy):
     def build(cls, registry: SignatureRegistry, router: LSRRouter, *, bits: int = 128, seed: str = "jester-lsr-j5", minimum_jaccard: float = 0.5) -> "FingerprintGateSemanticStrategy":
         spec = FingerprintSpec(bits=bits, seed=seed)
         fingerprints = {facet: signature_fingerprint(registry.signatures[facet], spec) for facet in registry.snapshot().facets}
-        asset = cls._make_asset(registry, {"algorithm": spec.algorithm, "bits": bits, "seed": seed, "minimumJaccard": minimum_jaccard, "mode": "fingerprint-gate-then-semantic"}, fingerprints=fingerprints)
+        asset = cls._make_asset(registry, router, {"algorithm": spec.algorithm, "bits": bits, "seed": seed, "minimumJaccard": minimum_jaccard, "mode": "fingerprint-gate-then-semantic"}, fingerprints=fingerprints)
         return cls(registry, router, asset)
+
+    def __init__(self, registry: SignatureRegistry, router: LSRRouter, asset: StrategyAsset):
+        super().__init__(registry, router, asset)
+        config = asset.config
+        if set(config) != {"algorithm", "bits", "seed", "minimumJaccard", "mode", "router"} or config.get("mode") != "fingerprint-gate-then-semantic":
+            raise StrategyError("fingerprint-gate asset has missing or unknown config fields")
 
     def route(self, prompt: str, prompt_embedding: Any, *, candidate_facets: Iterable[str] | None = None) -> dict[str, Any]:
         names = self._candidate_names(candidate_facets)

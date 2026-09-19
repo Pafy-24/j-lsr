@@ -8,11 +8,15 @@ from lsr.models import LayeredSignature, SignatureLayer
 from lsr.registry import SignatureRegistry
 from lsr.routing import LSRRouter
 from lsr.strategies import (
+    FingerprintSpec,
     FingerprintGateSemanticStrategy,
     FingerprintOnlyStrategy,
     SemanticBaselineStrategy,
     StrategyAsset,
+    StrategyError,
     build_strategy,
+    fingerprint_hex,
+    jaccard_hex,
     load_strategy,
 )
 
@@ -88,3 +92,59 @@ def test_strategy_factory_builds_all_versioned_variants() -> None:
     for strategy_id in ("semantic-baseline-v1", "fingerprint-only-v1", "fingerprint-gate-semantic-v1"):
         strategy = build_strategy(strategy_id, registry, router)
         assert strategy.asset.strategy_id == strategy_id
+
+
+def test_snapshot_identity_includes_loaded_vector_content() -> None:
+    registry, _ = _registry()
+    before = registry.snapshot().identity
+    registry.signatures["first"].layers[1].vectors[0, 0] = 7.0
+    after = registry.snapshot().identity
+    assert after != before
+
+
+def test_signed_fingerprint_distinguishes_opposite_vectors() -> None:
+    spec = FingerprintSpec(bits=128, seed="counterexample")
+    positive = fingerprint_hex([1.0, 1.0], spec)
+    negative = fingerprint_hex([-1.0, -1.0], spec)
+    assert positive != negative
+    assert jaccard_hex(positive, negative, spec.bits) < 1.0
+
+
+def test_fingerprint_rejects_nonfinite_values() -> None:
+    spec = FingerprintSpec()
+    try:
+        fingerprint_hex([float("nan"), 1.0], spec)
+    except ValueError as error:
+        assert "non-finite" in str(error)
+    else:
+        raise AssertionError("non-finite vectors must fail closed")
+
+
+def test_asset_identity_includes_complete_router_settings() -> None:
+    registry, _ = _registry()
+    first = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=1))
+    second = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=9))
+    assert first.asset.identity != second.asset.identity
+
+
+def test_asset_loader_rejects_unknown_fields_and_algorithm() -> None:
+    registry, router = _registry()
+    asset = FingerprintOnlyStrategy.build(registry, router).asset.to_dict()
+    unknown = dict(asset)
+    unknown["unexpected"] = True
+    try:
+        StrategyAsset.from_dict(unknown)
+    except StrategyError as error:
+        assert "unknown" in str(error)
+    else:
+        raise AssertionError("unknown asset fields must fail closed")
+
+    invalid_algorithm = dict(asset)
+    invalid_algorithm["config"] = dict(asset["config"])
+    invalid_algorithm["config"]["algorithm"] = "toy-unsupported"
+    try:
+        StrategyAsset.from_dict(invalid_algorithm)
+    except StrategyError as error:
+        assert "algorithm" in str(error)
+    else:
+        raise AssertionError("unknown fingerprint algorithms must fail closed")

@@ -14,6 +14,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def router_settings(router: LSRRouter) -> dict[str, Any]:
+    return {
+        "topK": int(router.top_k),
+        "indexPolicy": str(router.index_policy),
+        "modelName": str(router.model_name),
+        "memoryLimitMb": float(router.memory_limit_mb),
+        "descendThreshold": router.descend_threshold,
+        "acceptThreshold": router.accept_threshold,
+        "fullDepth": bool(router.full_depth),
+        "cachePolicy": str(router.cache_policy),
+        "thresholds": router.thresholds_label(),
+        "weightSemantics": FACET_WEIGHT_SEMANTICS,
+    }
+
+
 class Strategy:
     strategy_id = ""
     version = "1"
@@ -22,12 +37,17 @@ class Strategy:
         self.registry = registry
         self.router = router
         self.asset = asset
+        expected_router = asset.config.get("router")
+        if expected_router != router_settings(router):
+            raise StrategyError("strategy asset router settings differ from supplied router")
         self._check_snapshot()
 
     @classmethod
-    def _make_asset(cls, registry: SignatureRegistry, config: dict[str, Any], *, fingerprints: dict[str, str] | None = None, created_at: str = "") -> StrategyAsset:
+    def _make_asset(cls, registry: SignatureRegistry, router: LSRRouter, config: dict[str, Any], *, fingerprints: dict[str, str] | None = None, created_at: str = "") -> StrategyAsset:
         snapshot = registry.snapshot()
-        return StrategyAsset.create(cls.strategy_id, cls.version, snapshot.identity, config, fingerprints=fingerprints, created_at=created_at or utc_now())
+        complete_config = dict(config)
+        complete_config["router"] = router_settings(router)
+        return StrategyAsset.create(cls.strategy_id, cls.version, snapshot.identity, complete_config, fingerprints=fingerprints, created_at=created_at or utc_now())
 
     def _check_snapshot(self) -> RegistrySnapshot:
         snapshot = self.registry.snapshot()

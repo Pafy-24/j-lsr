@@ -673,6 +673,7 @@ python router.py loadsig [--options]
 python router.py unloadsig [--options]
 python router.py sign [--options] [-in dataset.json | "raw text"]
 python router.py rank [--options] [-in prompt.txt | "prompt text"]
+python router.py strategy build|load [--options]
 python router.py benchmark-models [--options]
 python router.py evaluate [--options]
 
@@ -700,6 +701,7 @@ serve:
 --top-k N             Default returned result limit, default 3
 --index auto|flat|hnsw
                       Index policy, default auto
+--strategy-asset PATH Versioned strategy asset validated before encoder load
 
 loadsig:
 --signatures PATH     .sig file or directory to load into server RAM/VRAM
@@ -716,6 +718,13 @@ sign:
 --signatures PATH     Output .sig file or directory
 --max-vectors N       Maximum anchor vectors stored per faucet, default 10000
 --debug               Print extra details
+
+strategy:
+build                 Requires --output PATH; writes an asset from current signatures/router settings
+load                  Requires --asset PATH; validates the asset against current signatures/router settings
+--strategy-id ID      semantic-baseline-v1, fingerprint-only-v1, or fingerprint-gate-semantic-v1
+--fingerprint-bits N, --fingerprint-seed TEXT, --minimum-jaccard N
+                      Experimental fingerprint configuration for build
 
 rank:
 -in, --input PATH     Prompt file, or batch input with --batch
@@ -734,6 +743,9 @@ rank:
 --json                Print machine-readable JSON output
 --ascii-table         Use ASCII-safe table borders
 --debug               Print extra details
+--strategy-asset PATH Select an asset for --local ranking; remote services select it at startup
+--strategy-operation route|explain|profile
+                      Explicit local/HTTP asset operation; managed channels authorize route only
 
 benchmark-models:
 -in, --input PATH     Labeled benchmark path, default test pretrain files under ../facets

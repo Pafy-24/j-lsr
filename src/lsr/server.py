@@ -31,6 +31,7 @@ from .profiling import RankProfiler
 from .registry import SignatureRegistry
 from .routing import LSRRouter, json_ready_route
 from .routing_context import agent_event_to_text
+from .strategies import Strategy, load_strategy
 
 
 class LSRRouteService:
@@ -48,6 +49,7 @@ class LSRRouteService:
         load_initial_signatures: bool = True,
         monitor_enabled: bool = True,
         model_identity: str | None = None,
+        strategy_asset_path: str | None = None,
     ):
         if default_top_k < 1:
             raise RouterError("--top-k must be at least 1.")
@@ -73,6 +75,14 @@ class LSRRouteService:
             self.signatures,
             model_identity=model_identity,
         )
+        # The asset has no encoder payload. Bind and validate it before any
+        # optional local encoder resolution can allocate or download a model.
+        self.router = self.build_router(default_top_k)
+        self.strategy_asset_path: str | None = None
+        self.strategy: Strategy | None = None
+        if strategy_asset_path:
+            self.load_strategy_asset(strategy_asset_path)
+
         ram_before_model = current_process_ram_bytes()
         self.model = load_model(self.model_load_path, pu_index, online)
         self.embedding_batcher = EmbeddingBatcher(
@@ -115,7 +125,6 @@ class LSRRouteService:
                     ", ".join(device for device in model_tensor_bytes if device.startswith("cuda")),
                     persistent=True,
                 )
-        self.router = self.build_router(default_top_k)
 
     def build_router(
         self,
@@ -207,6 +216,8 @@ class LSRRouteService:
             signature_files = self.registry.signature_files_payload()
             stale_signatures = list(self.registry.stale_signatures)
             disabled_facets = sorted(self.registry.disabled_facets)
+            strategy = self.strategy
+            strategy_asset_path = self.strategy_asset_path
         processing_units = (
             self.monitor.processing_units_payload() if self.monitor is not None else []
         )
@@ -265,7 +276,49 @@ class LSRRouteService:
                 for facet, signature in sorted(signatures.items())
             },
             "default_top_k": self.default_top_k,
+            "strategy": (
+                {
+                    "assetPath": strategy_asset_path,
+                    "asset": strategy.asset.to_dict(),
+                    "snapshotId": strategy.asset.snapshot_id,
+                }
+                if strategy is not None
+                else None
+            ),
         }
+
+    def load_strategy_asset(self, path: str) -> dict[str, Any]:
+        """Bind a validated, versioned strategy asset to the service router."""
+        with self._state_lock:
+            strategy = load_strategy(path, self.registry, self.router)
+            self.strategy = strategy
+            self.strategy_asset_path = str(path)
+            return {
+                "assetPath": self.strategy_asset_path,
+                "asset": strategy.asset.to_dict(),
+                "snapshotId": strategy.asset.snapshot_id,
+            }
+
+    def _selected_strategy(
+        self,
+        top_k: int,
+        full_depth: bool,
+        operation: str,
+    ) -> Strategy | None:
+        if operation not in {"route", "explain", "profile"}:
+            raise RouterError("strategy_operation must be route, explain, or profile.")
+        strategy = self.strategy
+        if strategy is None:
+            if operation != "route":
+                raise RouterError("strategy_operation requires a configured strategy asset.")
+            return None
+        if top_k != self.default_top_k or full_depth:
+            raise RouterError(
+                "A configured strategy asset requires the service default top_k and full_depth=false."
+            )
+        # Validate snapshot and immutable router settings before embedding work.
+        strategy.snapshot()
+        return strategy
 
     def load_signatures(self, path: str, required: bool = True) -> dict[str, Any]:
         with self._state_lock:
@@ -273,11 +326,18 @@ class LSRRouteService:
             loaded = registry.load(required=required)
             if getattr(self, "model_name", "auto") != "auto":
                 validate_signature_model_compatibility(self.model_name, loaded)
+            router = self.build_router(self.default_top_k, loaded)
+            asset_path = getattr(self, "strategy_asset_path", None)
+            strategy = (
+                load_strategy(asset_path, registry, router)
+                if asset_path is not None
+                else None
+            )
             self.registry = registry
             self.signatures = registry.signatures
             self.signatures_path = path
-            if hasattr(self, "router"):
-                self.router = self.build_router(self.default_top_k)
+            self.router = router
+            self.strategy = strategy
             self._sync_signature_components()
             return {
                 "loaded": sorted(loaded),
@@ -322,6 +382,7 @@ class LSRRouteService:
         full_depth: bool = False,
         large_input: str = "auto",
         allowed_facets: list[str] | None = None,
+        strategy_operation: str = "route",
     ) -> dict[str, Any]:
         profiler = RankProfiler()
         profiler.start()
@@ -330,24 +391,53 @@ class LSRRouteService:
             raise RouterError("Missing prompt.")
         self.refresh_signatures()
         active_top_k = self._top_k(top_k)
-        router = self.routing_router(active_top_k, allowed_facets)
+        strategy = self._selected_strategy(active_top_k, full_depth, strategy_operation)
+        router = None if strategy is not None else self.routing_router(active_top_k, allowed_facets)
         routing_input = prepare_routing_input(prompt, large_input)
         self._status("embedding", f"1 input on {getattr(self.model, 'device', 'selected PU')}")
         embedding_started = time.perf_counter()
         prompt_embedding = self.embedding_batcher.embed(routing_input.routing_units)
         profiler.stage("embedding", embedding_started)
         routing_started = time.perf_counter()
-        route = router.route(
-            routing_input.routing_text,
-            prompt_embedding,
-            active_top_k,
-            full_depth=full_depth,
-        )
+        if strategy is None:
+            assert router is not None
+            route = router.route(
+                routing_input.routing_text,
+                prompt_embedding,
+                active_top_k,
+                full_depth=full_depth,
+            )
+            response = json_ready_route(route)
+        elif strategy_operation == "explain":
+            response = strategy.explain(
+                routing_input.routing_text,
+                prompt_embedding,
+                candidate_facets=allowed_facets,
+            )
+            route = response["route"]
+        elif strategy_operation == "profile":
+            response = strategy.profile(
+                routing_input.routing_text,
+                prompt_embedding,
+                candidate_facets=allowed_facets,
+                embedding_ms=profiler.stages.get("embedding"),
+            )
+            route = response["route"]
+        else:
+            route = strategy.route(
+                routing_input.routing_text,
+                prompt_embedding,
+                candidate_facets=allowed_facets,
+            )
         profiler.stage("routing", routing_started)
         attach_input_metadata(route, routing_input)
-        response = json_ready_route(route)
+        effective_signatures = router.signatures if strategy is None else strategy.registry.signatures
+        if strategy_operation in {"explain", "profile"}:
+            response["route"] = json_ready_route(route)
+        else:
+            response = json_ready_route(route)
         response["candidateFacetFilter"] = candidate_facet_filter(
-            allowed_facets, router.signatures
+            allowed_facets, effective_signatures
         )
         response["performance"] = profiler.finish()
         if self.monitor is not None:
@@ -364,6 +454,7 @@ class LSRRouteService:
         full_depth: bool = False,
         large_input: str = "auto",
         allowed_facets: list[str] | None = None,
+        strategy_operation: str = "route",
     ) -> list[dict[str, Any]]:
         started = time.perf_counter()
         cleaned = [prompt.strip() for prompt in prompts]
@@ -378,7 +469,10 @@ class LSRRouteService:
             if not prompt:
                 raise RouterError(f"Batch item {index} has no prompt text.")
         active_top_k = self._top_k(top_k)
-        router = self.routing_router(active_top_k, allowed_facets)
+        strategy = self._selected_strategy(active_top_k, full_depth, strategy_operation)
+        if strategy_operation != "route":
+            raise RouterError("strategy explain/profile are supported for one route request only.")
+        router = None if strategy is not None else self.routing_router(active_top_k, allowed_facets)
         routing_inputs = [prepare_routing_input(prompt, large_input) for prompt in cleaned]
         self._status("embedding", f"batch of {len(routing_inputs)} inputs")
         flat_units = [unit for item in routing_inputs for unit in item.routing_units]
@@ -387,17 +481,27 @@ class LSRRouteService:
         offset = 0
         for routing_input in routing_inputs:
             unit_count = len(routing_input.routing_units)
-            route = router.route(
-                routing_input.routing_text,
-                embeddings[offset : offset + unit_count],
-                active_top_k,
-                full_depth=full_depth,
-            )
+            if strategy is None:
+                assert router is not None
+                route = router.route(
+                    routing_input.routing_text,
+                    embeddings[offset : offset + unit_count],
+                    active_top_k,
+                    full_depth=full_depth,
+                )
+                effective_signatures = router.signatures
+            else:
+                route = strategy.route(
+                    routing_input.routing_text,
+                    embeddings[offset : offset + unit_count],
+                    candidate_facets=allowed_facets,
+                )
+                effective_signatures = strategy.registry.signatures
             offset += unit_count
             attach_input_metadata(route, routing_input)
             response = json_ready_route(route)
             response["candidateFacetFilter"] = candidate_facet_filter(
-                allowed_facets, router.signatures
+                allowed_facets, effective_signatures
             )
             routes.append(response)
         if self.monitor is not None:
@@ -492,13 +596,16 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            payload = self._read_json()
+            strategy_operation = extract_strategy_operation(payload)
             if self.server.require_managed_session:
                 if self.path not in {"/route", "/rank"} or self.server.managed_channel_guard is None:
                     raise ChannelSessionDenied("managed channel request is not authorized")
+                if strategy_operation != "route":
+                    raise ChannelSessionDenied("managed channel only authorizes route operations")
                 self.server.managed_channel_guard.authorize(
                     self.headers, operation="lsr.route", method="POST"
                 )
-            payload = self._read_json()
             if self.path in {"/route", "/rank"}:
                 response = self.server.service.route_one(
                     extract_prompt(payload),
@@ -506,6 +613,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                     extract_full_depth(payload),
                     extract_large_input(payload),
                     extract_allowed_facets(payload),
+                    strategy_operation,
                 )
             elif self.path == "/batch":
                 response = self.server.service.route_batch(
@@ -514,6 +622,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                     extract_full_depth(payload),
                     extract_large_input(payload),
                     extract_allowed_facets(payload),
+                    strategy_operation,
                 )
             elif self.path == "/loadsig":
                 response = self.server.service.load_signatures(extract_signature_path(payload))
@@ -655,6 +764,17 @@ def extract_large_input(payload: Any) -> str:
     return str(mode)
 
 
+def extract_strategy_operation(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "route"
+    value = payload.get("strategy_operation")
+    if value is None:
+        value = payload.get("strategyOperation", "route")
+    if value not in {"route", "explain", "profile"}:
+        raise RouterError("strategy_operation must be route, explain, or profile.")
+    return str(value)
+
+
 def candidate_facet_filter(
     requested: list[str] | None, effective_signatures: dict[str, Any]
 ) -> dict[str, Any]:
@@ -727,6 +847,7 @@ def serve(
     monitor_enabled: bool = True,
     workers: int = 4,
     model_identity: str | None = None,
+    strategy_asset_path: str | None = None,
 ) -> None:
     service = LSRRouteService(
         signatures_path=signatures_path,
@@ -741,6 +862,7 @@ def serve(
         load_initial_signatures=load_initial_signatures,
         monitor_enabled=monitor_enabled,
         model_identity=model_identity,
+        strategy_asset_path=strategy_asset_path,
     )
     managed = os.environ.get("JESTER_RM_REQUIRED", "").lower() in {"1", "true", "yes", "on"}
     try:

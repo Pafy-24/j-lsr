@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import os
+import json
+import threading
+from types import SimpleNamespace
+from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -10,6 +15,7 @@ from lsr.errors import RouterError
 from lsr.models import LayeredSignature, SignatureLayer
 from lsr.registry import SignatureRegistry
 from lsr.routing import LSRRouter
+from lsr.server import LSRHTTPServer, LSRRouteService
 from lsr.signatures import SignatureCodec
 from lsr.strategies import (
     FingerprintSpec,
@@ -23,6 +29,20 @@ from lsr.strategies import (
     jaccard_hex,
     load_strategy,
 )
+
+
+class _TinyCpuEncoder:
+    """Deliberately tiny test double: no model download or accelerator path."""
+
+    backend = "tiny-cpu"
+    device = "cpu"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode(self, texts, **_kwargs):
+        self.calls += 1
+        return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
 
 
 def _signature(facet: str, vector: list[float]) -> LayeredSignature:
@@ -178,6 +198,242 @@ def test_lazy_codec_does_not_read_or_retain_the_whole_signature_file(tmp_path) -
         loaded = codec.load(path)
     assert loaded.layer_loader is not None
     assert loaded.layer_digests
+
+
+def test_registry_streams_source_digest_during_load_and_snapshot(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    path = codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    registry = SignatureRegistry(path)
+
+    with patch.object(path.__class__, "read_bytes", side_effect=AssertionError("whole-file read")):
+        registry.load()
+        # Exercise the fallback path as well, which is used for registries
+        # reconstructed from already-loaded signatures.
+        registry.file_digests.clear()
+        snapshot = registry.snapshot()
+
+    assert snapshot.entries[0].content_sha256
+
+
+def test_strategy_loader_rejects_version_that_does_not_match_implementation(tmp_path) -> None:
+    registry, router = _registry()
+    baseline = SemanticBaselineStrategy.build(registry, router).asset
+    incompatible = StrategyAsset.create(
+        baseline.strategy_id,
+        "2",
+        baseline.snapshot_id,
+        baseline.config,
+        fingerprints=baseline.fingerprint_map,
+        created_at=baseline.created_at,
+    )
+    path = tmp_path / "incompatible-version.json"
+    incompatible.save(path)
+
+    with pytest.raises(StrategyError, match="version differs"):
+        load_strategy(str(path), registry, router)
+
+
+def test_strategy_loader_rejects_router_threshold_override(tmp_path) -> None:
+    registry, router = _registry()
+    asset_path = tmp_path / "semantic-baseline.json"
+    SemanticBaselineStrategy.build(registry, router).asset.save(asset_path)
+    overridden = LSRRouter(registry.signatures, top_k=2, accept_threshold=0.9)
+
+    with pytest.raises(StrategyError, match="router settings differ"):
+        load_strategy(str(asset_path), registry, overridden)
+
+
+def test_invalid_asset_fails_before_service_encoder_load(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    path = codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    registry = SignatureRegistry(path)
+    registry.load()
+    baseline = SemanticBaselineStrategy.build(
+        registry, LSRRouter(registry.signatures, top_k=1, model_name="test-model")
+    ).asset
+    invalid_path = tmp_path / "wrong-version.json"
+    StrategyAsset.create(
+        baseline.strategy_id,
+        "2",
+        baseline.snapshot_id,
+        baseline.config,
+        fingerprints=baseline.fingerprint_map,
+        created_at=baseline.created_at,
+    ).save(invalid_path)
+
+    with patch("lsr.server.load_model", side_effect=AssertionError("encoder must not load")) as load_model:
+        with pytest.raises(StrategyError, match="version differs"):
+            LSRRouteService(
+                str(path), "test-model", None, False, 1,
+                monitor_enabled=False, strategy_asset_path=str(invalid_path),
+            )
+    assert load_model.call_count == 0
+
+
+def test_search_only_profile_does_not_invent_embedding_total() -> None:
+    registry, router = _registry()
+    profile = SemanticBaselineStrategy.build(registry, router).profile(
+        "first", np.asarray([1.0, 0.0], dtype=np.float32)
+    )
+    assert profile["timing"]["scope"] == "search-only"
+    assert profile["timing"]["embeddingMs"] is None
+    assert profile["timing"]["totalMs"] is None
+
+
+def test_service_http_and_cli_bind_the_same_validated_asset_without_model_download(tmp_path, monkeypatch, capsys) -> None:
+    codec = SignatureCodec("test-model")
+    codec.save(tmp_path / "first.sig", _signature("first", [1.0, 0.0]))
+    codec.save(tmp_path / "second.sig", _signature("second", [-1.0, 0.0]))
+    registry = SignatureRegistry(tmp_path)
+    registry.load()
+    router = LSRRouter(registry.signatures, top_k=1, model_name="test-model")
+    asset_path = tmp_path / "semantic-baseline.json"
+    SemanticBaselineStrategy.build(registry, router).asset.save(asset_path)
+
+    # The CLI load operation uses only signatures and the asset; it has no
+    # encoder construction path. Its printed asset is the exact service asset.
+    from lsr.commands import RouterCLI
+
+    cli_args = SimpleNamespace(
+        PUs=False,
+        command="strategy",
+        action="load",
+        signatures=str(tmp_path),
+        asset=str(asset_path),
+        output=None,
+        strategy_id="semantic-baseline-v1",
+        model="test-model",
+        index="auto",
+        memory_limit_mb=0.0,
+        descend_threshold=None,
+        accept_threshold=None,
+        top_k=1,
+        fingerprint_bits=128,
+        fingerprint_seed="jester-lsr-j5",
+        minimum_jaccard=0.5,
+    )
+    assert RouterCLI(cli_args).run() == 0
+    cli_payload = json.loads(capsys.readouterr().out)
+    assert cli_payload["asset"]["assetId"] == StrategyAsset.load(asset_path).identity
+
+    encoder = _TinyCpuEncoder()
+    with patch("lsr.server.load_model", return_value=encoder) as load_model:
+        service = LSRRouteService(
+            signatures_path=str(tmp_path),
+            model_name="test-model",
+            pu_index=None,
+            online=False,
+            default_top_k=1,
+            monitor_enabled=False,
+            strategy_asset_path=str(asset_path),
+        )
+    try:
+        assert load_model.call_count == 1
+        assert service.health()["strategy"]["asset"]["assetId"] == cli_payload["asset"]["assetId"]
+        direct = service.route_one("first", allowed_facets=["first"])
+        assert [item["facet"] for item in direct["results"]] == ["first"]
+
+        http = LSRHTTPServer(("127.0.0.1", 0), service)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{http.server_port}/route",
+                data=json.dumps({"input": "first", "allowedFacets": ["first"]}).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            assert [item["facet"] for item in payload["results"]] == ["first"]
+        finally:
+            http.shutdown()
+            http.server_close()
+
+        with pytest.raises(RouterError, match="default top_k"):
+            service.route_one("first", top_k=2)
+        with pytest.raises(RouterError, match="full_depth=false"):
+            service.route_one("first", full_depth=True)
+    finally:
+        service.close()
+
+
+def test_service_rejects_changed_registry_before_embedding_after_refresh(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    path = codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    registry = SignatureRegistry(path)
+    registry.load()
+    asset_path = tmp_path / "semantic-baseline.json"
+    SemanticBaselineStrategy.build(
+        registry, LSRRouter(registry.signatures, top_k=1, model_name="test-model")
+    ).asset.save(asset_path)
+    encoder = _TinyCpuEncoder()
+    with patch("lsr.server.load_model", return_value=encoder):
+        service = LSRRouteService(
+            str(path), "test-model", None, False, 1,
+            monitor_enabled=False, strategy_asset_path=str(asset_path),
+        )
+    try:
+        codec.save(path, _signature("facet", [-1.0, 0.0]))
+        service.refresh_signatures(force=True)
+        calls_before = encoder.calls
+        with pytest.raises(StrategyError, match="registry snapshot differs"):
+            service.route_one("facet")
+        assert encoder.calls == calls_before
+    finally:
+        service.close()
+
+
+def test_service_preserves_large_input_metadata_before_route_serialization(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    encoder = _TinyCpuEncoder()
+    with patch("lsr.server.load_model", return_value=encoder):
+        service = LSRRouteService(
+            str(tmp_path), "test-model", None, False, 1, monitor_enabled=False
+        )
+    try:
+        source = "# routing heading\n" + ("semantic routing payload. " * 800)
+        route = service.route_one(source, large_input="force")
+        assert route["inputMode"] == "digest"
+        assert route["inputChars"] == len(source.strip())
+        assert route["routingTextChars"] < len(source.strip())
+        assert route["chunksUsed"] >= 1
+        assert route["routingUnits"] >= 1
+    finally:
+        service.close()
+
+
+def test_signature_reload_rejects_asset_mismatch_without_rebinding_old_registry(tmp_path) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    codec = SignatureCodec("test-model")
+    codec.save(first_dir / "facet.sig", _signature("facet", [1.0, 0.0]))
+    codec.save(second_dir / "facet.sig", _signature("facet", [-1.0, 0.0]))
+    first_registry = SignatureRegistry(first_dir)
+    first_registry.load()
+    asset_path = tmp_path / "semantic-baseline.json"
+    SemanticBaselineStrategy.build(
+        first_registry, LSRRouter(first_registry.signatures, top_k=1, model_name="test-model")
+    ).asset.save(asset_path)
+    encoder = _TinyCpuEncoder()
+    with patch("lsr.server.load_model", return_value=encoder):
+        service = LSRRouteService(
+            str(first_dir), "test-model", None, False, 1,
+            monitor_enabled=False, strategy_asset_path=str(asset_path),
+        )
+    try:
+        old_snapshot = service.health()["strategy"]["snapshotId"]
+        with pytest.raises(StrategyError, match="registry snapshot differs"):
+            service.load_signatures(str(second_dir))
+        assert service.health()["strategy"]["snapshotId"] == old_snapshot
+        assert service.health()["signatures"] == str(first_dir)
+        route = service.route_one("facet")
+        assert route["selectedFacets"]
+    finally:
+        service.close()
 
 
 def test_real_lazy_request_filters_are_isolated_concurrently(tmp_path) -> None:

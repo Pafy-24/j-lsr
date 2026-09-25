@@ -10,6 +10,15 @@ from .models import LayeredSignature
 from .signatures import SignatureCodec
 
 
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    """Hash a signature without materializing it in the Python heap."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @dataclass
 class SignatureFileState:
     facet: str
@@ -163,7 +172,7 @@ class SignatureRegistry:
         self.signatures[signature.facet] = signature
         self.files[signature.facet] = file_path
         self.file_stats[signature.facet] = (stat.st_mtime, stat.st_size)
-        self.file_digests[signature.facet] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        self.file_digests[signature.facet] = _sha256_file(file_path)
         self.disabled_facets.discard(signature.facet)
         return signature
 
@@ -230,7 +239,7 @@ class SignatureRegistry:
             resolved_path = str(path.resolve()) if path is not None else ""
             if path is not None and path.exists() and path.is_file():
                 if facet not in self.file_digests:
-                    self.file_digests[facet] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    self.file_digests[facet] = _sha256_file(path)
                 content_sha256 = self.file_digests[facet]
                 size = int(self.file_stats.get(facet, (0.0, path.stat().st_size))[1])
             else:

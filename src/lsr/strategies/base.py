@@ -37,6 +37,10 @@ class Strategy:
         self.registry = registry
         self.router = router
         self.asset = asset
+        if asset.strategy_id != self.strategy_id:
+            raise StrategyError("strategy asset ID differs from supplied strategy")
+        if asset.version != self.version:
+            raise StrategyError("strategy asset version differs from supplied strategy")
         expected_router = asset.config.get("router")
         if expected_router != router_settings(router):
             raise StrategyError("strategy asset router settings differ from supplied router")
@@ -109,4 +113,15 @@ class Strategy:
         started = perf_counter()
         route = self.route(prompt, prompt_embedding, candidate_facets=candidate_facets)
         search_ms = (perf_counter() - started) * 1000.0
-        return {"strategyId": self.asset.strategy_id, "strategyVersion": self.asset.version, "timing": {"embeddingMs": embedding_ms, "searchMs": search_ms, "totalMs": search_ms + float(embedding_ms or 0.0)}, "route": route}
+        measured_total = search_ms + float(embedding_ms) if embedding_ms is not None else None
+        return {
+            "strategyId": self.asset.strategy_id,
+            "strategyVersion": self.asset.version,
+            "timing": {
+                "scope": "embedding-and-search" if embedding_ms is not None else "search-only",
+                "embeddingMs": embedding_ms,
+                "searchMs": search_ms,
+                "totalMs": measured_total,
+            },
+            "route": route,
+        }

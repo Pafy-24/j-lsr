@@ -25,6 +25,8 @@ from .routing import LSRRouter, json_ready_route
 from .rm_integration import require_managed_launch, start_telemetry
 from .server import serve
 from .signatures import SignatureBuilder, SignatureStore
+from .registry import SignatureRegistry
+from .strategies import build_strategy, load_strategy
 
 
 class RouterCLI:
@@ -32,7 +34,7 @@ class RouterCLI:
         self.args = args
 
     def run(self) -> int:
-        if self.args.PUs:
+        if getattr(self.args, "PUs", False):
             print_processing_units()
             return 0
         if self.args.command == "sign":
@@ -55,12 +57,14 @@ class RouterCLI:
                 self.route_prompt()
             else:
                 self.rank_remote()
+        elif self.args.command == "strategy":
+            self.strategy_asset()
         elif self.args.command == "benchmark-models":
             self.benchmark_models()
         elif self.args.command == "evaluate":
             self.evaluate()
         else:
-            raise RouterError("Missing command. Use serve, loadsig, unloadsig, sign, or rank.")
+            raise RouterError("Missing command. Use serve, loadsig, unloadsig, sign, rank, or strategy.")
         return 0
 
     def sign_dataset(self) -> None:
@@ -101,13 +105,7 @@ class RouterCLI:
         console.print(f"Saved vector signature to [bold]{output_path}[/bold]")
 
     def route_prompt(self) -> None:
-        signatures = SignatureStore(self.args.signatures).load_all(required=True)
-        if not signatures:
-            raise RouterError(f"No facets found in signature path: {self.args.signatures}")
-        model_name = resolve_model_name(self.args.model, signatures)
-        validate_signature_model_compatibility(model_name, signatures)
-        if self.args.top_k < 1:
-            raise RouterError("--top-k must be at least 1.")
+        registry, router, model_name = self._local_registry_router()
 
         routing_input = None
         if self.args.input_path:
@@ -128,33 +126,45 @@ class RouterCLI:
         prompt_embedding = embed_texts(model, routing_input.routing_units)
         profiler.stage("embedding", embedding_started)
         routing_started = time.perf_counter()
-        route = LSRRouter(
-            signatures,
-            self.args.top_k,
-            index_policy=self.args.index,
-            model_name=model_name,
-            memory_limit_mb=self.args.memory_limit_mb,
-            descend_threshold=self.args.descend_threshold,
-            accept_threshold=self.args.accept_threshold,
-            full_depth=self.args.full_depth,
-        ).route(routing_input.routing_text, prompt_embedding)
+        strategy = self._local_strategy(registry, router)
+        if strategy is None:
+            route = router.route(routing_input.routing_text, prompt_embedding)
+            result: dict[str, Any] = route
+        elif self.args.strategy_operation == "explain":
+            result = strategy.explain(routing_input.routing_text, prompt_embedding)
+            route = result["route"]
+        elif self.args.strategy_operation == "profile":
+            result = strategy.profile(
+                routing_input.routing_text,
+                prompt_embedding,
+                embedding_ms=profiler.stages.get("embedding"),
+            )
+            route = result["route"]
+        else:
+            route = strategy.route(routing_input.routing_text, prompt_embedding)
+            result = route
         profiler.stage("routing", routing_started)
-        route["performance"] = profiler.finish()
         attach_input_metadata(route, routing_input)
+        if result is route:
+            route["performance"] = profiler.finish()
+        else:
+            result["performance"] = profiler.finish()
 
-        if self.args.json:
-            print(json.dumps(json_ready_route(route), ensure_ascii=False))
+        if self.args.json or result is not route:
+            if result is not route:
+                result = dict(result)
+                result["route"] = json_ready_route(route)
+            else:
+                result = json_ready_route(route)
+            print(json.dumps(result, ensure_ascii=False))
         else:
             print_route_table(route, self.args)
 
     def route_batch(self) -> None:
-        signatures = SignatureStore(self.args.signatures).load_all(required=True)
-        if not signatures:
-            raise RouterError(f"No facets found in signature path: {self.args.signatures}")
-        model_name = resolve_model_name(self.args.model, signatures)
-        validate_signature_model_compatibility(model_name, signatures)
-        if self.args.top_k < 1:
-            raise RouterError("--top-k must be at least 1.")
+        registry, router, model_name = self._local_registry_router()
+        strategy = self._local_strategy(registry, router)
+        if self.args.strategy_operation != "route":
+            raise RouterError("strategy explain/profile are supported for one local rank request only.")
 
         raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
         prompts = load_batch_prompts(raw)
@@ -162,25 +172,16 @@ class RouterCLI:
         routing_inputs = [prepare_routing_input(prompt, self.args.large_input) for prompt in prompts]
         flat_units = [unit for item in routing_inputs for unit in item.routing_units]
         embeddings = embed_texts(model, flat_units)
-        router = LSRRouter(
-            signatures,
-            self.args.top_k,
-            index_policy=self.args.index,
-            model_name=model_name,
-            memory_limit_mb=self.args.memory_limit_mb,
-            descend_threshold=self.args.descend_threshold,
-            accept_threshold=self.args.accept_threshold,
-            full_depth=self.args.full_depth,
-        )
         routes = []
         offset = 0
         for routing_input in routing_inputs:
             unit_count = len(routing_input.routing_units)
             routes.append(
                 with_input_metadata(
-                    router.route(
-                        routing_input.routing_text,
-                        embeddings[offset : offset + unit_count],
+                    (
+                        strategy.route(routing_input.routing_text, embeddings[offset : offset + unit_count])
+                        if strategy is not None
+                        else router.route(routing_input.routing_text, embeddings[offset : offset + unit_count])
                     ),
                     routing_input,
                 )
@@ -209,7 +210,73 @@ class RouterCLI:
             monitor_enabled=not self.args.no_monitor,
             workers=self.args.workers,
             model_identity=self.args.model_identity,
+            strategy_asset_path=self.args.strategy_asset,
         )
+
+    def _local_registry_router(self) -> tuple[SignatureRegistry, LSRRouter, str]:
+        registry = SignatureRegistry(self.args.signatures)
+        signatures = registry.load(required=True)
+        if not signatures:
+            raise RouterError(f"No facets found in signature path: {self.args.signatures}")
+        model_name = resolve_model_name(self.args.model, signatures)
+        validate_signature_model_compatibility(model_name, signatures)
+        if self.args.top_k < 1:
+            raise RouterError("--top-k must be at least 1.")
+        return registry, LSRRouter(
+            signatures,
+            self.args.top_k,
+            index_policy=self.args.index,
+            model_name=model_name,
+            memory_limit_mb=self.args.memory_limit_mb,
+            descend_threshold=self.args.descend_threshold,
+            accept_threshold=self.args.accept_threshold,
+            full_depth=self.args.full_depth,
+        ), model_name
+
+    def _local_strategy(self, registry: SignatureRegistry, router: LSRRouter):
+        asset_path = self.args.strategy_asset
+        if not asset_path:
+            if self.args.strategy_operation != "route":
+                raise RouterError("--strategy-operation requires --strategy-asset.")
+            return None
+        return load_strategy(asset_path, registry, router)
+
+    def strategy_asset(self) -> None:
+        registry = SignatureRegistry(self.args.signatures)
+        signatures = registry.load(required=True)
+        if not signatures:
+            raise RouterError(f"No facets found in signature path: {self.args.signatures}")
+        model_name = resolve_model_name(self.args.model, signatures)
+        validate_signature_model_compatibility(model_name, signatures)
+        if self.args.top_k < 1:
+            raise RouterError("--top-k must be at least 1.")
+        router = LSRRouter(
+            signatures,
+            self.args.top_k,
+            index_policy=self.args.index,
+            model_name=model_name,
+            memory_limit_mb=self.args.memory_limit_mb,
+            descend_threshold=self.args.descend_threshold,
+            accept_threshold=self.args.accept_threshold,
+        )
+        if self.args.action == "build":
+            if not self.args.output:
+                raise RouterError("strategy build requires --output.")
+            config = {}
+            if self.args.strategy_id != "semantic-baseline-v1":
+                config = {
+                    "bits": self.args.fingerprint_bits,
+                    "seed": self.args.fingerprint_seed,
+                    "minimum_jaccard": self.args.minimum_jaccard,
+                }
+            strategy = build_strategy(self.args.strategy_id, registry, router, **config)
+            strategy.asset.save(self.args.output)
+            print(json.dumps(strategy.asset.to_dict(), ensure_ascii=False))
+            return
+        if not self.args.asset:
+            raise RouterError("strategy load requires --asset.")
+        strategy = load_strategy(self.args.asset, registry, router)
+        print(json.dumps({"asset": strategy.asset.to_dict(), "snapshot": strategy.snapshot().to_dict()}, ensure_ascii=False))
 
     def loadsig(self) -> None:
         response = post_json(
@@ -230,6 +297,10 @@ class RouterCLI:
         print(json.dumps(response, ensure_ascii=False))
 
     def rank_remote(self) -> None:
+        if self.args.strategy_asset:
+            raise RouterError(
+                "--strategy-asset is local-only for rank; configure it when starting the target service."
+            )
         if self.args.batch:
             raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
             prompts = load_batch_prompts(raw)
@@ -241,6 +312,7 @@ class RouterCLI:
                     "top_k": self.args.top_k,
                     "full_depth": self.args.full_depth,
                     "large_input": self.args.large_input,
+                    "strategy_operation": self.args.strategy_operation,
                 },
             )
         else:
@@ -260,6 +332,7 @@ class RouterCLI:
                     "top_k": self.args.top_k,
                     "full_depth": self.args.full_depth,
                     "large_input": "off" if routing_input is not None else self.args.large_input,
+                    "strategy_operation": self.args.strategy_operation,
                 },
             )
             if routing_input is not None:

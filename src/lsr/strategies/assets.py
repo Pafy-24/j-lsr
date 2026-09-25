@@ -10,13 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..errors import RouterError
 
 ASSET_SCHEMA_VERSION = "lsr-strategy-asset-v1"
 KNOWN_STRATEGIES = {"semantic-baseline-v1", "fingerprint-only-v1", "fingerprint-gate-semantic-v1"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-class StrategyError(ValueError):
+class StrategyError(RouterError, ValueError):
     """A strategy asset or registry snapshot cannot be used safely."""
 
 

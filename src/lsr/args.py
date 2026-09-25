@@ -113,6 +113,16 @@ def add_server_target_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_strategy_asset_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--strategy-asset",
+        help=(
+            "Versioned LSR strategy asset. It is validated against the loaded "
+            "signature registry and router settings; omitted keeps the semantic baseline."
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="LSR (Layered Signatures Router) command line interface."
@@ -140,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_index_option(serve)
     add_loading_policy_options(serve)
+    add_strategy_asset_option(serve)
     serve.add_argument("--host", default=DEFAULT_SERVER_HOST, help=f"Host address. Default: {DEFAULT_SERVER_HOST}")
     serve.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help=f"Port. Default: {DEFAULT_SERVER_PORT}")
     serve.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help=f"Default result count. Default: {DEFAULT_TOP_K}")
@@ -218,6 +229,13 @@ def parse_args() -> argparse.Namespace:
     add_index_option(rank)
     add_loading_policy_options(rank)
     add_input_policy_options(rank)
+    add_strategy_asset_option(rank)
+    rank.add_argument(
+        "--strategy-operation",
+        choices=("route", "explain", "profile"),
+        default="route",
+        help="Operation for an explicitly selected local or server strategy asset.",
+    )
     add_server_target_option(rank)
     rank.add_argument(
         "--top-k",
@@ -247,6 +265,27 @@ def parse_args() -> argparse.Namespace:
         help="Load model/signatures locally instead of using the running server.",
     )
     rank.add_argument("--debug", action="store_true", help="Print extra details.")
+
+    strategy = subparsers.add_parser(
+        "strategy",
+        help="Build or validate a versioned LSR strategy asset without loading an encoder.",
+    )
+    strategy.add_argument("action", choices=("build", "load"))
+    add_signature_path_option(strategy)
+    strategy.add_argument("--asset", help="Existing strategy asset path for strategy load.")
+    strategy.add_argument("--output", help="Destination asset path for strategy build.")
+    strategy.add_argument(
+        "--strategy-id",
+        choices=("semantic-baseline-v1", "fingerprint-only-v1", "fingerprint-gate-semantic-v1"),
+        default="semantic-baseline-v1",
+    )
+    strategy.add_argument("--model", default="auto", help="Model identity to bind into router settings; auto reads .sig metadata.")
+    add_index_option(strategy)
+    add_loading_policy_options(strategy)
+    strategy.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    strategy.add_argument("--fingerprint-bits", type=int, default=128)
+    strategy.add_argument("--fingerprint-seed", default="jester-lsr-j5")
+    strategy.add_argument("--minimum-jaccard", type=float, default=0.5)
 
     benchmark = subparsers.add_parser(
         "benchmark-models",

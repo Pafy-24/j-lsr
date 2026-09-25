@@ -65,5 +65,22 @@ strategy measures search and accepts embedding time from the caller. Empty
 expected labels are valid and contribute to abstention metrics. No pilot-v3
 performance or independent-heldout claim is made.
 
-Server, CLI, RM lease, and channel integration are intentionally outside this
-checkpoint and remain for the follow-up handshake.
+## Optional service and CLI binding
+
+The semantic route remains the default. A caller selects an asset explicitly:
+
+- `jester-lsr strategy build|load` builds or validates an asset using loaded
+  signatures and router settings without constructing an encoder;
+- `jester-lsr serve --strategy-asset PATH` validates and binds the asset before
+  its encoder is loaded;
+- `jester-lsr rank --local --strategy-asset PATH --strategy-operation
+  route|explain|profile` selects it locally; a remote client selects the
+  service already started with that asset.
+
+`/route` and `/rank` also accept explicit `strategy_operation` values. Managed
+channels authorize `route` only; `explain` and `profile` are rejected there.
+An asset fixes the registry snapshot and router configuration. A service rejects
+incompatible `top_k`, `full_depth`, asset version, signature reload, or refreshed
+snapshot; it does not fall back to a different router. `profile` declares
+`search-only` and leaves total time unavailable when the caller did not provide
+embedding time.

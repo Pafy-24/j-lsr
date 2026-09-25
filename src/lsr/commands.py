@@ -106,6 +106,9 @@ class RouterCLI:
 
     def route_prompt(self) -> None:
         registry, router, model_name = self._local_registry_router()
+        # Bind the asset before constructing an encoder so an incompatible
+        # local strategy fails without allocating or downloading a model.
+        strategy = self._local_strategy(registry, router)
 
         routing_input = None
         if self.args.input_path:
@@ -126,7 +129,6 @@ class RouterCLI:
         prompt_embedding = embed_texts(model, routing_input.routing_units)
         profiler.stage("embedding", embedding_started)
         routing_started = time.perf_counter()
-        strategy = self._local_strategy(registry, router)
         if strategy is None:
             route = router.route(routing_input.routing_text, prompt_embedding)
             result: dict[str, Any] = route

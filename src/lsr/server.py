@@ -596,16 +596,16 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            payload = self._read_json()
-            strategy_operation = extract_strategy_operation(payload)
             if self.server.require_managed_session:
                 if self.path not in {"/route", "/rank"} or self.server.managed_channel_guard is None:
                     raise ChannelSessionDenied("managed channel request is not authorized")
-                if strategy_operation != "route":
-                    raise ChannelSessionDenied("managed channel only authorizes route operations")
                 self.server.managed_channel_guard.authorize(
                     self.headers, operation="lsr.route", method="POST"
                 )
+            payload = self._read_json()
+            strategy_operation = extract_strategy_operation(payload)
+            if self.server.require_managed_session and strategy_operation != "route":
+                raise ChannelSessionDenied("managed channel only authorizes route operations")
             if self.path in {"/route", "/rank"}:
                 response = self.server.service.route_one(
                     extract_prompt(payload),
@@ -770,7 +770,7 @@ def extract_strategy_operation(payload: Any) -> str:
     value = payload.get("strategy_operation")
     if value is None:
         value = payload.get("strategyOperation", "route")
-    if value not in {"route", "explain", "profile"}:
+    if not isinstance(value, str) or value not in {"route", "explain", "profile"}:
         raise RouterError("strategy_operation must be route, explain, or profile.")
     return str(value)
 

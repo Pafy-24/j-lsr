@@ -29,15 +29,19 @@ from lsr.server import LSRHTTPServer
 
 
 class _RouteService:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
     def health(self):
         return {"status": "ok"}
 
     def route_one(self, prompt, *_args):
+        self.calls.append(prompt)
         return {"accepted": prompt}
 
 
-def _post(port: int, credential: str) -> tuple[int, dict]:
-    request = Request(f"http://127.0.0.1:{port}/route", data=b'{"input":"deterministic"}', method="POST")
+def _post(port: int, credential: str, body: bytes = b'{"input":"deterministic"}') -> tuple[int, dict]:
+    request = Request(f"http://127.0.0.1:{port}/route", data=body, method="POST")
     request.add_header("Content-Type", "application/json")
     request.add_header("X-Jester-Component-Session", credential)
     try:
@@ -76,12 +80,18 @@ def test_rm_issued_session_controls_actual_lsr_route_handler(tmp_path, monkeypat
         def local(operation: str, method: str):
             return {"destinationInstanceId":"lsr-one","destinationInstanceGeneration":1,"destinationLeaseId":"lsr-lease","operation":operation,"method":method}
         guard = ManagedChannelGuard(ManagedChannelContext(rm_url="http://unused"), introspect=lambda credential, expected: controller.introspect_controller_channel_session(credential, expectation=expected) or {}, expectation_provider=local)
-        server = LSRHTTPServer(("127.0.0.1", 0), _RouteService(), managed_channel_guard=guard, require_managed_session=True)
+        service = _RouteService()
+        server = LSRHTTPServer(("127.0.0.1", 0), service, managed_channel_guard=guard, require_managed_session=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         assert _post(server.server_port, first["credential"]) == (200, {"accepted":"deterministic"})
         renewed = controller.controller_channel_sessions(grant["credential"], project_id="project-one", deployment_id="deployment-one")["items"][0]
         assert _post(server.server_port, first["credential"])[0] == 401
+        # An invalid session is rejected before body parsing, even for malformed JSON.
+        assert _post(server.server_port, "invalid-session", b"{")[0] == 401
         assert _post(server.server_port, renewed["credential"])[0] == 200
+        # The managed channel only grants lsr.route; explain/profile remain local-only.
+        assert _post(server.server_port, renewed["credential"], b'{"input":"deterministic","strategy_operation":"explain"}')[0] == 401
+        assert service.calls == ["deterministic", "deterministic"]
         guard._expectation_provider = lambda operation, method: {**local(operation, method), "destinationLeaseId":"wrong-lease"}
         assert _post(server.server_port, renewed["credential"])[0] == 401
     finally:

@@ -270,6 +270,50 @@ def test_invalid_asset_fails_before_service_encoder_load(tmp_path) -> None:
     assert load_model.call_count == 0
 
 
+def test_invalid_local_rank_asset_fails_before_encoder_load(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    signature_path = codec.save(tmp_path / "facet.sig", _signature("facet", [1.0, 0.0]))
+    registry = SignatureRegistry(signature_path)
+    registry.load()
+    baseline = SemanticBaselineStrategy.build(
+        registry, LSRRouter(registry.signatures, top_k=1, model_name="test-model")
+    ).asset
+    invalid_path = tmp_path / "wrong-version.json"
+    StrategyAsset.create(
+        baseline.strategy_id,
+        "2",
+        baseline.snapshot_id,
+        baseline.config,
+        fingerprints=baseline.fingerprint_map,
+        created_at=baseline.created_at,
+    ).save(invalid_path)
+
+    from lsr.commands import RouterCLI
+
+    args = SimpleNamespace(
+        signatures=str(signature_path),
+        model="test-model",
+        index="auto",
+        memory_limit_mb=0.0,
+        descend_threshold=None,
+        accept_threshold=None,
+        full_depth=False,
+        top_k=1,
+        strategy_asset=str(invalid_path),
+        strategy_operation="route",
+        input_path=None,
+        text="facet",
+        large_input="off",
+        PU=None,
+        online=False,
+        json=True,
+    )
+    with patch("lsr.commands.load_model", side_effect=AssertionError("encoder must not load")) as load_model:
+        with pytest.raises(StrategyError, match="version differs"):
+            RouterCLI(args).route_prompt()
+    assert load_model.call_count == 0
+
+
 def test_search_only_profile_does_not_invent_embedding_total() -> None:
     registry, router = _registry()
     profile = SemanticBaselineStrategy.build(registry, router).profile(
@@ -450,6 +494,33 @@ def test_real_lazy_request_filters_are_isolated_concurrently(tmp_path) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         assert list(executor.map(route, ["first", "second"])) == [["first"], ["second"]]
+
+
+def test_real_lazy_unfiltered_and_filtered_routes_are_request_local_concurrently(tmp_path) -> None:
+    codec = SignatureCodec("test-model")
+    codec.save(tmp_path / "first.sig", _signature("first", [1.0, 0.0]))
+    codec.save(tmp_path / "second.sig", _signature("second", [-1.0, 0.0]))
+    registry = SignatureRegistry(tmp_path)
+    registry.load()
+    strategy = SemanticBaselineStrategy.build(registry, LSRRouter(registry.signatures, top_k=2))
+    embedding = np.asarray([1.0, 0.0], dtype=np.float32)
+
+    def route(candidate_facets):
+        return [
+            item["facet"]
+            for item in strategy.route("prompt", embedding, candidate_facets=candidate_facets)["results"]
+        ]
+
+    # The bound router owns mutable request metrics and lazy-layer caches; no
+    # strategy request may call it directly, including the default baseline.
+    with patch.object(strategy.router, "route", side_effect=AssertionError("shared router used")):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            unfiltered = executor.submit(route, None)
+            filtered = executor.submit(route, ["first"])
+            assert unfiltered.result() == ["first", "second"]
+            assert filtered.result() == ["first"]
+
+    assert all(not signature.layers for signature in registry.signatures.values())
 
 
 def test_asset_loader_rejects_unknown_fields_and_algorithm() -> None:

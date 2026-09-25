@@ -96,8 +96,8 @@ class Strategy:
 
     def route(self, prompt: str, prompt_embedding: Any, *, candidate_facets: Iterable[str] | None = None) -> dict[str, Any]:
         names = self._candidate_names(candidate_facets)
-        if candidate_facets is None:
-            return self.router.route(prompt, prompt_embedding)
+        # Each route gets its own lazy-layer cache and router metrics. The
+        # unfiltered baseline must keep the same isolation as filtered calls.
         return self._route_semantic_subset(prompt, prompt_embedding, names)
 
     def explain(self, prompt: str, prompt_embedding: Any, *, candidate_facets: Iterable[str] | None = None) -> dict[str, Any]:

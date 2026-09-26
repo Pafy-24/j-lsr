@@ -33,6 +33,11 @@ from .registry import SignatureRegistry
 from .strategies import build_strategy, load_strategy
 
 
+def _print_json_stdout(value: Any, *, indent: int | None = None) -> None:
+    """Emit JSON that remains UTF-8 compatible on legacy Windows streams."""
+    print(json.dumps(value, ensure_ascii=True, indent=indent))
+
+
 class RouterCLI:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -172,7 +177,7 @@ class RouterCLI:
                 result["route"] = json_ready_route(route)
             else:
                 result = json_ready_route(route)
-            print(json.dumps(result, ensure_ascii=False))
+            _print_json_stdout(result)
         else:
             print_route_table(route, self.args)
 
@@ -203,7 +208,7 @@ class RouterCLI:
                 )
             )
             offset += unit_count
-        print(json.dumps([json_ready_route(route) for route in routes], ensure_ascii=False))
+        _print_json_stdout([json_ready_route(route) for route in routes])
 
     def serve(self) -> None:
         console.print(
@@ -290,12 +295,12 @@ class RouterCLI:
                 }
             strategy = build_strategy(self.args.strategy_id, registry, router, **config)
             strategy.asset.save(self.args.output)
-            print(json.dumps(strategy.asset.to_dict(), ensure_ascii=False))
+            _print_json_stdout(strategy.asset.to_dict())
             return
         if not self.args.asset:
             raise RouterError("strategy load requires --asset.")
         strategy = load_strategy(self.args.asset, registry, router)
-        print(json.dumps({"asset": strategy.asset.to_dict(), "snapshot": strategy.snapshot().to_dict()}, ensure_ascii=False))
+        _print_json_stdout({"asset": strategy.asset.to_dict(), "snapshot": strategy.snapshot().to_dict()})
 
     def loadsig(self) -> None:
         response = post_json(
@@ -303,7 +308,7 @@ class RouterCLI:
             "/loadsig",
             {"signatures": self.args.signatures},
         )
-        print(json.dumps(response, ensure_ascii=False))
+        _print_json_stdout(response)
 
     def unloadsig(self) -> None:
         if not self.args.all and not self.args.facet:
@@ -313,7 +318,7 @@ class RouterCLI:
             "/unloadsig",
             {"facets": self.args.facet or [], "all": self.args.all},
         )
-        print(json.dumps(response, ensure_ascii=False))
+        _print_json_stdout(response)
 
     def rank_remote(self) -> None:
         if self.args.strategy_asset:
@@ -360,7 +365,7 @@ class RouterCLI:
                 response["routingTextChars"] = routing_input.routing_text_chars
                 response["chunksUsed"] = routing_input.chunks_used
         if self.args.batch or self.args.json:
-            print(json.dumps(response, ensure_ascii=False))
+            _print_json_stdout(response)
         else:
             print_route_table(response, self.args)
 
@@ -435,7 +440,7 @@ class RouterCLI:
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        _print_json_stdout(payload, indent=2)
 
     def evaluate(self) -> None:
         signatures = SignatureStore(self.args.signatures).load_all(required=True)
@@ -473,7 +478,7 @@ class RouterCLI:
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        _print_json_stdout(payload, indent=2)
 
     def evaluate_once(
         self,

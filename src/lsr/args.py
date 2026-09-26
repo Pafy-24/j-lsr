@@ -37,6 +37,16 @@ def add_runtime_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_model_identity_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model-identity",
+        help=(
+            "Portable model identity used for signature metadata and compatibility. "
+            "Use this when --model is an RM artifact path for the same immutable model."
+        ),
+    )
+
+
 def add_index_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--index",
@@ -141,13 +151,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(serve)
     add_runtime_options(serve)
-    serve.add_argument(
-        "--model-identity",
-        help=(
-            "Portable model identity stored in signatures. Use this when --model "
-            "is an RM artifact path for the same immutable model."
-        ),
-    )
+    add_model_identity_option(serve)
     add_index_option(serve)
     add_loading_policy_options(serve)
     add_strategy_asset_option(serve)
@@ -204,6 +208,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(sign)
     add_runtime_options(sign)
+    add_model_identity_option(sign)
     sign.add_argument(
         "--max-vectors",
         type=int,
@@ -226,6 +231,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_signature_path_option(rank)
     add_runtime_options(rank)
+    add_model_identity_option(rank)
     add_index_option(rank)
     add_loading_policy_options(rank)
     add_input_policy_options(rank)

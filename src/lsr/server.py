@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import itertools
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,10 @@ from .registry import SignatureRegistry
 from .routing import LSRRouter, json_ready_route
 from .routing_context import agent_event_to_text
 from .strategies import Strategy, load_strategy
+
+
+DENIED_REQUEST_BODY_DISCARD_MAX_BYTES = min(DEFAULT_SERVER_MAX_REQUEST_BYTES, 64 * 1024)
+DENIED_REQUEST_BODY_DISCARD_DEADLINE_SECONDS = 0.25
 
 
 class LSRRouteService:
@@ -595,6 +600,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
     def do_POST(self) -> None:
+        body_consumed = False
         try:
             if self.server.require_managed_session:
                 if self.path not in {"/route", "/rank"} or self.server.managed_channel_guard is None:
@@ -603,6 +609,7 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                     self.headers, operation="lsr.route", method="POST"
                 )
             payload = self._read_json()
+            body_consumed = True
             strategy_operation = extract_strategy_operation(payload)
             if self.server.require_managed_session and strategy_operation != "route":
                 raise ChannelSessionDenied("managed channel only authorizes route operations")
@@ -634,6 +641,8 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
                 return
             self._write_json(HTTPStatus.OK, response)
         except ChannelSessionDenied:
+            if not body_consumed:
+                self._discard_denied_request_body()
             self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "managed channel session is not authorized"})
         except RouterError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -660,6 +669,43 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except UnicodeDecodeError as exc:
             raise RouterError("JSON body must be UTF-8.") from exc
+
+    def _discard_denied_request_body(self) -> int:
+        """Best-effort discard of a small denied body before closing the socket."""
+        if self.headers.get("Transfer-Encoding") is not None:
+            return 0
+        content_lengths = self.headers.get_all("Content-Length", [])
+        if len(content_lengths) != 1:
+            return 0
+        raw_length = content_lengths[0]
+        if not raw_length.isascii() or not raw_length.isdigit():
+            return 0
+        if len(raw_length) > len(str(DENIED_REQUEST_BODY_DISCARD_MAX_BYTES)):
+            return 0
+        length = int(raw_length)
+        if length <= 0 or length > DENIED_REQUEST_BODY_DISCARD_MAX_BYTES:
+            return 0
+
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + DENIED_REQUEST_BODY_DISCARD_DEADLINE_SECONDS
+        remaining = length
+        discarded = 0
+        try:
+            while remaining:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    break
+                self.connection.settimeout(timeout)
+                chunk = self.rfile.read1(min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                discarded += len(chunk)
+                remaining -= len(chunk)
+        except (OSError, TimeoutError, socket.timeout):
+            pass
+        finally:
+            self.connection.settimeout(previous_timeout)
+        return discarded
 
     def _write_json(self, status: HTTPStatus, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

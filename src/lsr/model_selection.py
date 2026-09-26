@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from .errors import RouterError
 from .models import LayeredSignature
 
@@ -36,6 +38,19 @@ def validate_signature_model_compatibility(
     model_name: str,
     signatures: dict[str, LayeredSignature],
 ) -> None:
+    invalid_hashes = sorted(
+        signature.facet
+        for signature in signatures.values()
+        if signature.model_name
+        and signature.model_hash
+        and signature.model_hash
+        != hashlib.sha256(signature.model_name.encode("utf-8")).digest()[:16]
+    )
+    if invalid_hashes:
+        raise RouterError(
+            f"Loaded signatures for {', '.join(invalid_hashes)} have invalid modelHash metadata. "
+            "Re-sign them with the current CLI."
+        )
     if model_name == "auto":
         return
     mismatched = sorted(

@@ -18,7 +18,11 @@ from .errors import RouterError
 from .input_digest import prepare_routing_input, prepare_routing_input_from_path
 from .io_utils import load_batch_prompts, read_file, read_stdin_if_available, read_text_arg
 from .memory import current_footprint_bytes, format_bytes
-from .model_selection import resolve_model_name, validate_signature_model_compatibility
+from .model_selection import (
+    resolve_model_binding,
+    resolve_model_name,
+    validate_signature_model_compatibility,
+)
 from .models import FacetSignature
 from .profiling import RankProfiler
 from .routing import LSRRouter, json_ready_route
@@ -71,14 +75,19 @@ class RouterCLI:
         default_facet = self.args.facet.strip().lower() if self.args.facet else None
         items = load_lsr_dataset(self.args.input_path, default_facet)
         grouped = grouped_examples(items_to_examples(items))
-        model = load_model(self.args.model, self.args.PU, self.args.online)
+        load_path, model_identity = resolve_model_binding(
+            self.args.model,
+            {},
+            model_identity=getattr(self.args, "model_identity", None),
+        )
+        model = load_model(load_path, self.args.PU, self.args.online)
         builder = SignatureBuilder(self.args.max_vectors)
         store = SignatureStore(self.args.signatures)
 
         signatures: list[FacetSignature] = []
         for facet, texts in sorted(grouped.items()):
             facet_signature, layered_signature = builder.build_from_texts(facet, texts, model)
-            output_path = store.save(layered_signature, self.args.model)
+            output_path = store.save(layered_signature, model_identity)
             signatures.append(facet_signature)
             if self.args.debug:
                 layer_text = ", ".join(
@@ -97,15 +106,20 @@ class RouterCLI:
         if not text:
             raise RouterError("Missing text to sign. Provide raw text or use -in dataset.json.")
         facet = infer_facet_from_paths(None, self.args.signatures, self.args.facet)
-        model = load_model(self.args.model, self.args.PU, self.args.online)
+        load_path, model_identity = resolve_model_binding(
+            self.args.model,
+            {},
+            model_identity=getattr(self.args, "model_identity", None),
+        )
+        model = load_model(load_path, self.args.PU, self.args.online)
         builder = SignatureBuilder(self.args.max_vectors)
         facet_signature, layered_signature = builder.build_from_texts(facet, [text], model)
-        output_path = SignatureStore(self.args.signatures).save(layered_signature, self.args.model)
+        output_path = SignatureStore(self.args.signatures).save(layered_signature, model_identity)
         print_signature_summary([facet_signature])
         console.print(f"Saved vector signature to [bold]{output_path}[/bold]")
 
     def route_prompt(self) -> None:
-        registry, router, model_name = self._local_registry_router()
+        registry, router, model_load_path = self._local_registry_router()
         # Bind the asset before constructing an encoder so an incompatible
         # local strategy fails without allocating or downloading a model.
         strategy = self._local_strategy(registry, router)
@@ -120,7 +134,7 @@ class RouterCLI:
         if not prompt:
             raise RouterError("Missing prompt. Provide -in input.txt, raw text, or stdin.")
 
-        model = load_model(model_name, self.args.PU, self.args.online)
+        model = load_model(model_load_path, self.args.PU, self.args.online)
         if routing_input is None:
             routing_input = prepare_routing_input(prompt, self.args.large_input)
         profiler = RankProfiler()
@@ -163,14 +177,14 @@ class RouterCLI:
             print_route_table(route, self.args)
 
     def route_batch(self) -> None:
-        registry, router, model_name = self._local_registry_router()
+        registry, router, model_load_path = self._local_registry_router()
         strategy = self._local_strategy(registry, router)
         if self.args.strategy_operation != "route":
             raise RouterError("strategy explain/profile are supported for one local rank request only.")
 
         raw = read_file(self.args.input_path) if self.args.input_path else read_stdin_if_available()
         prompts = load_batch_prompts(raw)
-        model = load_model(model_name, self.args.PU, self.args.online)
+        model = load_model(model_load_path, self.args.PU, self.args.online)
         routing_inputs = [prepare_routing_input(prompt, self.args.large_input) for prompt in prompts]
         flat_units = [unit for item in routing_inputs for unit in item.routing_units]
         embeddings = embed_texts(model, flat_units)
@@ -220,20 +234,23 @@ class RouterCLI:
         signatures = registry.load(required=True)
         if not signatures:
             raise RouterError(f"No facets found in signature path: {self.args.signatures}")
-        model_name = resolve_model_name(self.args.model, signatures)
-        validate_signature_model_compatibility(model_name, signatures)
+        model_load_path, model_identity = resolve_model_binding(
+            self.args.model,
+            signatures,
+            model_identity=getattr(self.args, "model_identity", None),
+        )
         if self.args.top_k < 1:
             raise RouterError("--top-k must be at least 1.")
         return registry, LSRRouter(
             signatures,
             self.args.top_k,
             index_policy=self.args.index,
-            model_name=model_name,
+            model_name=model_identity,
             memory_limit_mb=self.args.memory_limit_mb,
             descend_threshold=self.args.descend_threshold,
             accept_threshold=self.args.accept_threshold,
             full_depth=self.args.full_depth,
-        ), model_name
+        ), model_load_path
 
     def _local_strategy(self, registry: SignatureRegistry, router: LSRRouter):
         asset_path = self.args.strategy_asset

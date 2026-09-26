@@ -8,8 +8,10 @@ if os.environ.get("JESTER_CROSS_REPO_TESTS") != "1":
 
 import json
 import os
+import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -25,7 +27,11 @@ from jester_rm.controller.service import ControllerService
 from jester_rm.models import Deployment, EntityMetadata, HostSpec, Lease
 
 from lsr.channel_sessions import ManagedChannelContext, ManagedChannelGuard
-from lsr.server import LSRHTTPServer
+from lsr.server import (
+    DENIED_REQUEST_BODY_DISCARD_MAX_BYTES,
+    LSRHTTPServer,
+    LSRRequestHandler,
+)
 
 
 class _RouteService:
@@ -49,6 +55,92 @@ def _post(port: int, credential: str, body: bytes = b'{"input":"deterministic"}'
             return response.status, json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         return error.code, json.loads(error.read().decode("utf-8"))
+
+
+def _raw_denied_post(
+    port: int,
+    *,
+    content_length: str | None,
+    body: bytes = b"",
+    transfer_encoding: str | None = None,
+    additional_content_length: str | None = None,
+) -> tuple[int, float]:
+    headers = [
+        "POST /route HTTP/1.1",
+        f"Host: 127.0.0.1:{port}",
+        "X-Jester-Component-Session: invalid-session",
+        "Content-Type: application/json",
+        "Connection: close",
+    ]
+    if content_length is not None:
+        headers.append(f"Content-Length: {content_length}")
+    if additional_content_length is not None:
+        headers.append(f"Content-Length: {additional_content_length}")
+    if transfer_encoding is not None:
+        headers.append(f"Transfer-Encoding: {transfer_encoding}")
+    request = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + body
+
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+        client.settimeout(2)
+        client.sendall(request)
+        response = bytearray()
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    elapsed = time.monotonic() - started
+    status_line = bytes(response).split(b"\r\n", 1)[0]
+    return int(status_line.split(b" ", 2)[1]), elapsed
+
+
+def _slow_trickle_denied_post(
+    port: int,
+    discard_started: threading.Event,
+) -> tuple[int, float]:
+    request = (
+        "\r\n".join(
+            (
+                "POST /route HTTP/1.1",
+                f"Host: 127.0.0.1:{port}",
+                "X-Jester-Component-Session: invalid-session",
+                "Content-Type: application/json",
+                "Content-Length: 4",
+                "Connection: close",
+            )
+        )
+        + "\r\n\r\n"
+    ).encode("ascii") + b"{"
+
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+        client.settimeout(2)
+        client.sendall(request)
+
+        def trickle() -> None:
+            if not discard_started.wait(timeout=1):
+                return
+            for byte in (b"x", b"y", b"z"):
+                time.sleep(0.18)
+                try:
+                    client.sendall(byte)
+                except OSError:
+                    return
+
+        sender = threading.Thread(target=trickle, daemon=True)
+        sender.start()
+        response = bytearray()
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        response_finished = time.monotonic()
+        sender.join(timeout=1)
+    elapsed = response_finished - started
+    status_line = bytes(response).split(b"\r\n", 1)[0]
+    return int(status_line.split(b" ", 2)[1]), elapsed
 
 
 def test_rm_issued_session_controls_actual_lsr_route_handler(tmp_path, monkeypatch) -> None:
@@ -81,13 +173,66 @@ def test_rm_issued_session_controls_actual_lsr_route_handler(tmp_path, monkeypat
             return {"destinationInstanceId":"lsr-one","destinationInstanceGeneration":1,"destinationLeaseId":"lsr-lease","operation":operation,"method":method}
         guard = ManagedChannelGuard(ManagedChannelContext(rm_url="http://unused"), introspect=lambda credential, expected: controller.introspect_controller_channel_session(credential, expectation=expected) or {}, expectation_provider=local)
         service = _RouteService()
+        discarded: list[int] = []
+        parsed_requests: list[str] = []
+        discard_started = threading.Event()
+        original_discard = LSRRequestHandler._discard_denied_request_body
+        original_read_json = LSRRequestHandler._read_json
+        def tracked_discard(handler: LSRRequestHandler) -> int:
+            discard_started.set()
+            count = original_discard(handler)
+            discarded.append(count)
+            return count
+        def tracked_read_json(handler: LSRRequestHandler):
+            parsed_requests.append(handler.path)
+            return original_read_json(handler)
+        monkeypatch.setattr(LSRRequestHandler, "_discard_denied_request_body", tracked_discard)
+        monkeypatch.setattr(LSRRequestHandler, "_read_json", tracked_read_json)
         server = LSRHTTPServer(("127.0.0.1", 0), service, managed_channel_guard=guard, require_managed_session=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         assert _post(server.server_port, first["credential"]) == (200, {"accepted":"deterministic"})
         renewed = controller.controller_channel_sessions(grant["credential"], project_id="project-one", deployment_id="deployment-one")["items"][0]
         assert _post(server.server_port, first["credential"])[0] == 401
         # An invalid session is rejected before body parsing, even for malformed JSON.
+        parsed_before_denial = len(parsed_requests)
         assert _post(server.server_port, "invalid-session", b"{")[0] == 401
+        assert len(parsed_requests) == parsed_before_denial
+        assert discarded[-1] == 1
+        # Denied bodies are only discarded when their framing is trusted and
+        # their complete size fits the strict cap. Missing bytes wait only for
+        # the short discard deadline before the handler returns its 401.
+        bounded_denials = (
+            _raw_denied_post(
+                server.server_port,
+                content_length=str(DENIED_REQUEST_BODY_DISCARD_MAX_BYTES + 1),
+            ),
+            _raw_denied_post(server.server_port, content_length="2", body=b"{"),
+            _raw_denied_post(server.server_port, content_length="1"),
+            _raw_denied_post(server.server_port, content_length="invalid"),
+            _raw_denied_post(server.server_port, content_length="9" * 5000),
+            _raw_denied_post(
+                server.server_port,
+                content_length="1",
+                additional_content_length="1",
+            ),
+            _raw_denied_post(
+                server.server_port,
+                content_length=None,
+                transfer_encoding="chunked",
+            ),
+        )
+        assert all(status == 401 and elapsed < 1.0 for status, elapsed in bounded_denials)
+        assert discarded[-7:] == [0, 1, 0, 0, 0, 0, 0]
+        assert len(parsed_requests) == parsed_before_denial
+        discard_started.clear()
+        trickle_status, trickle_elapsed = _slow_trickle_denied_post(
+            server.server_port,
+            discard_started,
+        )
+        assert trickle_status == 401
+        assert trickle_elapsed < 0.45
+        assert 0 < discarded[-1] < 4
+        assert len(parsed_requests) == parsed_before_denial
         assert _post(server.server_port, renewed["credential"])[0] == 200
         # The managed channel only grants lsr.route; explain/profile remain local-only.
         assert _post(server.server_port, renewed["credential"], b'{"input":"deterministic","strategy_operation":"explain"}')[0] == 401

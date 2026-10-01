@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "jester-component-manifest-v2",
+  "id": "lsr",
+  "version": "0.1.0",
+  "capabilities": [
+    {
+      "capability": {
+        "id": "lsr.route",
+        "version": "1",
+        "contractSha256": "412659fa9ef142cbef48300ee912a6ed4c39ea460cf67cfb369948cb5a02c8ab",
+        "concurrency": {"sharing": "dedicated-only", "maxConcurrentRequests": 1}
+      },
+      "configurationSchemaResourceId": "lsr.serve.configuration-schema.v1",
+      "configurationDefaultsResourceId": "lsr.serve.configuration-defaults.v1",
+      "capabilityContractResourceId": "lsr.route.capability.v1",
+      "adapterMappingResourceId": "lsr.serve.adapter-mapping.v1"
+    }
+  ],
+  "resources": [
+    {
+      "id": "lsr.route.capability.v1",
+      "kind": "capability-contract",
+      "mediaType": "application/json",
+      "installedPath": "resources/lsr-route-capability-v1.json",
+      "sha256": "412659fa9ef142cbef48300ee912a6ed4c39ea460cf67cfb369948cb5a02c8ab"
+    },
+    {
+      "id": "lsr.serve.configuration-schema.v1",
+      "kind": "configuration-schema",
+      "mediaType": "application/schema+json",
+      "installedPath": "resources/lsr-serve-configuration-v1.schema.json",
+      "sha256": "566c1172745558769dc8142453bae8c5fa4acffb05e8a490fc3b3329e4a1e554"
+    },
+    {
+      "id": "lsr.serve.configuration-defaults.v1",
+      "kind": "configuration-defaults",
+      "mediaType": "application/json",
+      "installedPath": "resources/lsr-serve-configuration-defaults-v1.json",
+      "sha256": "ab350eda94b5477eceb80a0bc5d517ab8fc7b6ac5f38e4e4d834bdb935c904d5"
+    },
+    {
+      "id": "lsr.serve.adapter-mapping.v1",
+      "kind": "adapter-mapping",
+      "mediaType": "application/json",
+      "installedPath": "resources/lsr-serve-adapter-mapping-v1.json",
+      "sha256": "1171d718e1ff0d7bc1c15d43a72d1b477f17f782b7881098f8311a345daf3280"
+    }
+  ],
+  "compatibility": []
+}

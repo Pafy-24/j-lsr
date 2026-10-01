@@ -35,6 +35,7 @@ jester-rm instance start lsr-npu-01
 - `router.py` - thin CLI compatibility entry point
 - `lsr\args.py` - CLI argument definitions
 - `lsr\defaults.json` - central defaults for models, paths, thresholds, index policy, and layer sizing
+- `lsr\resources\component-manifest.json` - installed portable `lsr.route` manifest; its four bound JSON resources declare the narrow configuration schema, partial defaults, capability contract, and closed `lsr.serve` mapping. The defaults supply only `topK`; encoder and signature assets remain required. The mapping is declarative and is not executed by LSR. Schema validation fixes the two asset roles and their reference shapes, but cannot prove that resolved bytes contain a compatible encoder or signature set; that later check belongs to the Runtime asset resolver.
 - `lsr\config.py` - Python accessors for `defaults.json`
 - `lsr\commands.py` - command orchestration for signing and routing
 - `lsr\dataset.py` - dataset-to-route-text extraction

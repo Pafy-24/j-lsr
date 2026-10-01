@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:jester:lsr:serve-configuration:v1",
+  "title": "LSR serve configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["encoder", "signatureSet", "topK"],
+  "properties": {
+    "encoder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "modelIdentity"],
+      "properties": {
+        "asset": {"$ref": "#/$defs/assetRef"},
+        "modelIdentity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^(?![A-Za-z]:)(?![./\\\\])(?!.*\\\\)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))[A-Za-z0-9][A-Za-z0-9._/+@-]{0,255}(?![\\s\\S])"
+        }
+      }
+    },
+    "signatureSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset"],
+      "properties": {"asset": {"$ref": "#/$defs/assetRef"}}
+    },
+    "topK": {"type": "integer", "minimum": 1, "maximum": 1024}
+  },
+  "$defs": {
+    "assetRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "sha256"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}(?![\\s\\S])"},
+        "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}(?![\\s\\S])"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}(?![\\s\\S])"}
+      }
+    }
+  }
+}

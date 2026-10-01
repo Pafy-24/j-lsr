@@ -13,7 +13,7 @@ dependencies = [
 semantic = ["sentence-transformers>=3", "scikit-learn>=1.4"]
 faiss = ["faiss-cpu>=1.8"]
 windows-ml = ["onnxruntime-windowsml"]
-test = ["pytest>=8"]
+test = ["pytest>=8", "jsonschema>=4,<5"]
 
 [project.scripts]
 jester-lsr = "lsr.commands:main"
@@ -22,4 +22,4 @@ jester-lsr = "lsr.commands:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-lsr = ["defaults.json"]
+lsr = ["defaults.json", "resources/*.json"]

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "jester-capability-contract-v1",
+  "id": "lsr.route",
+  "version": "1",
+  "transport": "http-json",
+  "method": "POST",
+  "paths": ["/route", "/rank"],
+  "channelOperation": "lsr.route",
+  "allowedManagedStrategyOperations": ["route"],
+  "request": {
+    "promptAliases": ["input", "prompt", "text"],
+    "optionalFields": ["top_k", "full_depth", "fullDepth", "large_input", "largeInput", "allowed_facets", "allowedFacets", "strategy_operation", "strategyOperation"]
+  }
+}

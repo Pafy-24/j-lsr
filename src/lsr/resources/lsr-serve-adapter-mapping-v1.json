@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "jester-adapter-mapping-v1",
+  "id": "lsr.serve",
+  "version": "1",
+  "adapter": "lsr.serve",
+  "assetRoles": {
+    "encoder": {"payloadRef": "/encoder/asset", "materialization": "directory", "argument": "--model"},
+    "signatureSet": {"payloadRef": "/signatureSet/asset", "materialization": "directory", "argument": "--signatures"}
+  },
+  "arguments": [
+    {"flag": "--model", "source": "resolvedAssetPath", "role": "encoder"},
+    {"flag": "--model-identity", "source": "payload", "pointer": "/encoder/modelIdentity"},
+    {"flag": "--signatures", "source": "resolvedAssetPath", "role": "signatureSet"},
+    {"flag": "--top-k", "source": "payload", "pointer": "/topK"}
+  ],
+  "environment": {},
+  "additionalArguments": false
+}

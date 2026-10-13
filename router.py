@@ -55,9 +55,14 @@ def native_qualification(argv: list[str]) -> int:
     parser.add_argument("--signatures", required=True)
     parser.add_argument("--prompt", required=True)
     values = parser.parse_args(argv)
-    for path in (values.model, values.signatures):
-        if not os.path.exists(path):
-            parser.error(f"local input does not exist: {path}")
+    if not values.prompt.strip() or len(values.prompt) > 4096:
+        parser.error("--prompt must contain 1..4096 characters")
+    values.model = os.path.abspath(values.model)
+    values.signatures = os.path.abspath(values.signatures)
+    if not os.path.isdir(values.model):
+        parser.error(f"local model directory does not exist: {values.model}")
+    if not os.path.exists(values.signatures):
+        parser.error(f"local signatures file or directory does not exist: {values.signatures}")
     started = time.perf_counter()
     saved = sys.argv
     try:

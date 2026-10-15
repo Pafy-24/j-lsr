@@ -53,10 +53,14 @@ def native_qualification(argv: list[str]) -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--model-identity", required=True)
     parser.add_argument("--signatures", required=True)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt", action="append", required=True)
     values = parser.parse_args(argv)
-    if not values.prompt.strip() or len(values.prompt) > 4096:
-        parser.error("--prompt must contain 1..4096 characters")
+    if len(values.prompt) != 2:
+        parser.error("--prompt must be supplied exactly twice")
+    if any(not prompt.strip() or len(prompt) > 4096 for prompt in values.prompt):
+        parser.error("each --prompt must contain 1..4096 characters")
+    if values.prompt[0] == values.prompt[1]:
+        parser.error("--prompt values must be distinct")
     values.model = os.path.abspath(values.model)
     values.signatures = os.path.abspath(values.signatures)
     if not os.path.isdir(values.model):
@@ -66,7 +70,7 @@ def native_qualification(argv: list[str]) -> int:
     started = time.perf_counter()
     saved = sys.argv
     try:
-        sys.argv = [saved[0], "rank", values.prompt, "--local", "--json", "--top-k", "2",
+        sys.argv = [saved[0], "rank", values.prompt[0], "--local", "--json", "--top-k", "2",
                     "--PU", "0", "--model", values.model, "--model-identity", values.model_identity,
                     "--signatures", values.signatures]
         args = parse_args()
@@ -80,12 +84,13 @@ def native_qualification(argv: list[str]) -> int:
     model_load_ms = (time.perf_counter() - model_started) * 1000.0
     startup_ms = (time.perf_counter() - started) * 1000.0
     requests = []
-    for index in range(2):
+    for index, prompt in enumerate(values.prompt):
         request_started = time.perf_counter()
-        routing_input = prepare_routing_input(values.prompt, args.large_input)
+        routing_input = prepare_routing_input(prompt, args.large_input)
         embedding = embed_texts(model, routing_input.routing_units)
         route = router.route(routing_input.routing_text, embedding) if strategy is None else strategy.route(routing_input.routing_text, embedding)
-        requests.append({"index": index, "durationMs": (time.perf_counter() - request_started) * 1000.0,
+        requests.append({"index": index, "input": prompt,
+                         "durationMs": (time.perf_counter() - request_started) * 1000.0,
                          "route": json_ready_route(route)})
     print(json.dumps({"schemaVersion": "jester-lsr-native-qualification-v1", "pid": os.getpid(),
                       "modelIdentity": values.model_identity, "startupMs": startup_ms,

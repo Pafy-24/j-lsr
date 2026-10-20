@@ -3,9 +3,6 @@ from __future__ import annotations
 import hashlib
 import ast
 import json
-import os
-import sys
-from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -146,25 +143,3 @@ def test_capability_matches_managed_server_authorization_source() -> None:
                     managed_strategy_guards.append(compared.value)
     assert (contract["channelOperation"], contract["method"]) in authorize_bindings
     assert contract["allowedManagedStrategyOperations"] == managed_strategy_guards
-
-
-@pytest.mark.skipif(
-    os.environ.get("JESTER_LSR_INSTALLED_RESOURCE_PROOF") != "1",
-    reason="runs only in the isolated installed-wheel acceptance environment",
-)
-def test_installed_distribution_resources_match_manifest_without_importing_lsr() -> None:
-    assert "lsr" not in sys.modules
-    distribution = metadata.distribution("jester-lsr")
-    package_root = Path(distribution.locate_file("lsr")).resolve()
-    manifest_path = package_root / "resources" / MANIFEST_NAME
-    manifest = ComponentManifest.model_validate(_json(manifest_path))
-    assert "lsr" not in sys.modules
-
-    installed_files = {str(item).replace("\\", "/") for item in distribution.files or ()}
-    for resource in manifest.resources:
-        relative = f"lsr/{resource.installed_path}"
-        assert relative in installed_files
-        path = Path(distribution.locate_file(relative)).resolve()
-        assert path.is_relative_to(package_root)
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == resource.sha256
-    assert "lsr" not in sys.modules

@@ -10,6 +10,7 @@ from tools.lsr_nuitka_plugin import (
     NuitkaPluginJesterLsrThirdPartyBytecode,
     REQUIRED_COMPLETE_PACKAGES,
     required_include_package_options,
+    required_exclude_data_file_options,
 )
 
 
@@ -50,3 +51,50 @@ def test_lazy_packages_are_explicitly_included_but_remain_bytecode() -> None:
     )
     assert plugin.decideCompilation(ModuleName("lsr")) == "compiled"
     assert plugin.decideCompilation(ModuleName("lsr.embedding")) == "compiled"
+
+
+def test_runtime_distribution_excludes_only_torch_development_headers() -> None:
+    from fnmatch import fnmatchcase
+
+    options = required_exclude_data_file_options()
+    assert options == ("--noinclude-data-files=torch/include/**",)
+    pattern = options[0].split("=", 1)[1]
+    assert fnmatchcase("torch/include/torch/csrc/api/include/torch/torch.h", pattern)
+    assert not fnmatchcase("torch/lib/torch_cpu.dll", pattern)
+    assert not fnmatchcase("lsr/resources/component-manifest.json", pattern)
+
+
+def test_lsr_command_uses_component_output_and_preserves_runtime_metadata(tmp_path) -> None:
+    from tools.lsr_nuitka_build import build_command
+
+    command = build_command(tmp_path / "python.exe", tmp_path, "release-01", tmp_path / "report.xml")
+    assert f"--output-dir={tmp_path / 'jester-engine/jester-components/built/j-lsr/windows-x64/release-01'}" in command
+    source = tmp_path / "jester-engine/jester-components/code/j-lsr"
+    assert command[-1] == str(source / "router.py")
+    assert f"--user-plugin={source / 'tools/lsr_nuitka_plugin.py'}" in command
+    assert required_exclude_data_file_options()[0] in command
+    assert "--include-distribution-metadata=torch" in command
+    assert "--include-distribution-metadata=filelock" in command
+    assert "--include-distribution-metadata=tokenizers" in command
+    assert "--include-package=huggingface_hub" in command
+    assert not any("built/engine" in arg.replace("\\", "/") for arg in command)
+    with pytest.raises(ValueError):
+        build_command(tmp_path / "python.exe", tmp_path, "../escape", tmp_path / "report.xml")
+
+
+def test_release_runtime_rejects_cpu_only_torch_without_hardware_probe(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    from tools import lsr_nuitka_build
+
+    captured = []
+    def run(argv, **kwargs):
+        captured.append(argv)
+        return SimpleNamespace(stdout=json.dumps({"torch": "2.11.0+cpu", "cuda": None}))
+    monkeypatch.setattr(lsr_nuitka_build.subprocess, "run", run)
+    with pytest.raises(ValueError, match="CPU-only"):
+        lsr_nuitka_build.validate_runtime(tmp_path / "python.exe")
+    assert "is_available" not in captured[0][-1]
+    monkeypatch.setattr(lsr_nuitka_build.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        stdout=json.dumps({"torch": "2.11.0+cu128", "cuda": "12.8"})))
+    assert lsr_nuitka_build.validate_runtime(tmp_path / "python.exe")["cuda"] == "12.8"

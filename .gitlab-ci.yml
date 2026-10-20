@@ -1,4 +1,5 @@
-image: python:3.11-slim
+# Use a shell runner with Python 3.11+ and development dependencies prepared.
+# Native artifacts are built explicitly with the platform toolchain.
 
 stages:
   - validate
@@ -21,7 +22,7 @@ before_script:
 validate:syntax:
   stage: validate
   script:
-    - python -m compileall router.py lsr
+    - python -m compileall router.py src/lsr
 
 validate:naming:
   stage: validate

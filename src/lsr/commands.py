@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from jester_sdk_runtime.lifecycle import telemetry_session
+
 from .args import parse_args
 from .console import console, error_console
 from .dataset import grouped_examples, infer_facet_from_paths
@@ -918,17 +920,13 @@ def post_json(server_url: str, path: str, payload: Any, timeout: int = 60) -> An
 
 def main() -> int:
     args = parse_args()
-    telemetry = None
     try:
         require_managed_launch(args)
-        telemetry = start_telemetry()
-        return RouterCLI(args).run()
+        with telemetry_session(start_telemetry):
+            return RouterCLI(args).run()
     except RouterError as exc:
         error_console.print(f"[red]Error:[/red] {exc}")
         return 2
     except KeyboardInterrupt:
         error_console.print("\n[red]Interrupted.[/red]")
         return 130
-    finally:
-        if telemetry is not None:
-            telemetry.close()

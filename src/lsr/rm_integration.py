@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from jester_sdk_runtime.lifecycle import start_telemetry
+
 from .errors import RouterError
 
 
@@ -81,12 +83,3 @@ def managed_processing_unit() -> Any:
         raise RouterError(f"{code}: {exc}") from exc
         code = getattr(exc, "code", "invalid_rm_lease")
         raise RouterError(f"{code}: {exc}") from exc
-
-
-def start_telemetry() -> Any:
-    try:
-        from jester_rm_client import start_default_telemetry
-
-        return start_default_telemetry()
-    except Exception:
-        return None

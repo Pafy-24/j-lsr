@@ -42,6 +42,7 @@ def build_command(python: Path, workspace: Path, version: str, report: Path) -> 
         "--output-filename=LSR.exe", f"--output-dir={output}",
         f"--report={report.resolve()}",
         "--include-package=lsr", "--include-package-data=lsr",
+        "--include-package=jester_sdk_runtime",
         "--include-package=huggingface_hub",
         *(f"--include-distribution-metadata={name}" for name in RUNTIME_DISTRIBUTIONS),
         "--noinclude-data-files=torch/include/**",

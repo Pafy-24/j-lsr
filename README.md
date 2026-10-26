@@ -44,7 +44,7 @@ jester-rm instance start lsr-npu-01
 - `lsr\embedding.py` - model loading and embedding helpers
 - `lsr\windows_ml.py` - Windows ML device registration and ONNX embeddings
 - `lsr\input_digest.py` - deterministic digest mode for very large inputs
-- `lsr\memory.py` - process RAM/VRAM footprint checks and release hooks
+- `lsr\memory.py` - functional allocator cleanup and release hooks; no process-footprint sampling
 - `lsr\registry.py` - server-side signature registry and stale-file refresh
 - `lsr\scoring.py` - lexical/generic/repetition diagnostics and score helpers
 - `lsr\signatures.py` - signature building, loading, saving, and DER codec
@@ -210,7 +210,7 @@ Default runtime behavior:
 
 There is no persistent global L1 index in runtime routing. `loadingPolicy=streaming-release-layer` means each vector layer is read with `seek/read`, compared, and removed before the next layer is loaded. Immutable parent-child topology is retained separately in a compact CSR-style `uint32` cache, so repeated requests do not decode thousands of DER integers again. The cache is shared safely by request-local routing copies and is reported independently from transient vector memory.
 
-The router still has a library-level footprint guard before loading each signature layer, but operational limits are declared as RM `ramBytes` and accelerator `memoryBudgetBytes`. The managed CLI rejects `--memory-limit-mb`, so there is one resource authority and one auditable lease.
+The router has a library-level budget for loaded signature-vector bytes before loading each layer. This is not process RAM/VRAM measurement or a process limit. Operational limits remain RM `ramBytes` and accelerator `memoryBudgetBytes`, applied by RMA. The managed CLI continues to reject `--memory-limit-mb`; local/library use interprets it as the vector budget. Allocator cleanup remains functional component behavior, while RMA observes process consumption externally.
 
 Layer decisions use per-layer thresholds from `lsr\defaults.json`:
 
@@ -688,7 +688,8 @@ Common runtime options:
 --PU N|auto           Legacy parser field; rejected for managed workloads. Device comes from lease.
 --index auto|flat|hnsw
                        Vector index backend; auto uses global L1 FlatIP and HNSW for large layers
---memory-limit-mb N   Legacy parser field; rejected for managed workloads. RAM/VRAM come from lease.
+--memory-limit-mb N   Local/library signature-vector budget in MiB, not process RAM/VRAM.
+                      Rejected for managed workloads; process limits come from the RM lease.
 --descend-threshold N Override all per-layer pass thresholds from defaults.json
 --accept-threshold N  Override all per-layer accept thresholds from defaults.json
 --large-input auto|off|force

@@ -84,7 +84,11 @@ class LayeredSignature:
     layer_digests: dict[int, str] = field(default_factory=dict)
 
     def levels(self) -> list[int]:
-        return sorted(self.layer_sizes or self.layers)
+        # Keep each operand explicit: Cython 3.3 cannot type sorted(a or b)
+        # for these dataclass fields during its early builtin-call pass.
+        if self.layer_sizes:
+            return sorted(self.layer_sizes)
+        return sorted(self.layers)
 
     def get_layer(self, level: int) -> SignatureLayer:
         if level not in self.layers:

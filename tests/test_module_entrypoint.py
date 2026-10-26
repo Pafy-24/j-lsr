@@ -13,7 +13,10 @@ SOURCE = PACKAGE / "src"
 
 def _module(*arguments: str) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(SOURCE)
+    # Source development includes the shared SDK runtime; compiled delivery
+    # carries it in the native shared library instead of requiring SDK sources.
+    sdk_source = PACKAGE.parents[3] / "jester-sdk" / "src"
+    environment["PYTHONPATH"] = os.pathsep.join((str(SOURCE), str(sdk_source)))
     return subprocess.run(
         [sys.executable, "-B", "-m", "lsr", *arguments],
         cwd=PACKAGE,

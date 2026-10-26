@@ -13,7 +13,6 @@ import numpy as np
 from lsr.config import DEFAULT_SERVER_MAX_BATCH_SIZE, DEFAULT_SERVER_MAX_REQUEST_BYTES
 from lsr.embedding import EmbeddingBatcher
 from lsr.errors import RouterError
-from lsr.memory import current_process_memory_bytes
 from lsr.models import LayeredSignature, SignatureLayer
 from lsr.routing import LSRRouter
 from lsr.registry import SignatureRegistry
@@ -27,10 +26,12 @@ from lsr.signatures import (
 
 
 class ResourceEfficiencyTests(unittest.TestCase):
-    def test_process_memory_snapshot_is_non_negative(self) -> None:
-        working_set, private = current_process_memory_bytes()
-        self.assertGreaterEqual(working_set, 0)
-        self.assertGreaterEqual(private, 0)
+    def test_signature_budget_counts_vectors_without_process_footprint(self) -> None:
+        signature = self._signature()
+        router = LSRRouter({"facet": signature}, memory_limit_mb=1)
+        router.ensure_memory_available(0, "existing vectors")
+        with self.assertRaisesRegex(RouterError, "Signature vector budget exceeded"):
+            router.ensure_memory_available(1024 * 1024 + 1, "oversized layer")
 
     def test_signature_decode_returns_normalized_writable_matrix(self) -> None:
         source = np.asarray([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32)

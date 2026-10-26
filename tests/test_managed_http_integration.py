@@ -253,3 +253,54 @@ def test_rm_issued_session_controls_actual_lsr_route_handler(tmp_path, monkeypat
         controller.close()
         if thread is not None:
             assert not thread.is_alive()
+
+
+
+def test_explicit_local_session_controls_native_http_handler(tmp_path, monkeypatch):
+    from jester_sdk_runtime.standalone_launch import local_guard
+    monkeypatch.delenv("JESTER_RM_REQUIRED", raising=False)
+    server = LSRHTTPServer(("127.0.0.1", 0), _RouteService(), require_managed_session=True)
+    context = {
+        "schemaVersion": "jester-local-launch-v1", "host": "127.0.0.1", "port": server.server_port,
+        "credential": "local-test-credential-longer-than-32-bytes", "operations": ["lsr.route"],
+    }
+    path = tmp_path / "launch.json"
+    path.write_text(json.dumps(context), encoding="utf-8")
+    monkeypatch.setenv("JESTER_STANDALONE_CONTEXT", str(path))
+    server.managed_channel_guard = local_guard(host="127.0.0.1", port=server.server_port)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        import hmac
+        for challenge in ["cd" * 32, "bad-challenge", "a" * 129]:
+            request = Request(f"http://127.0.0.1:{server.server_port}/health",
+                              headers={"X-Jester-Readiness-Challenge": challenge})
+            with urlopen(request, timeout=3) as response:
+                proof = response.headers.get("X-Jester-Readiness-Proof")
+                if challenge == "cd" * 32:
+                    assert proof == hmac.new(context["credential"].encode(), challenge.encode(), "sha256").hexdigest()
+                else:
+                    assert proof is None
+        assert _post(server.server_port, "invalid-local-credential")[0] == 401
+        assert _post(server.server_port, context["credential"]) == (200, {"accepted": "deterministic"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
+
+def test_native_serve_refuses_wrong_local_endpoint_before_loading(tmp_path, monkeypatch):
+    from lsr.server import serve
+    from lsr.errors import RouterError
+    monkeypatch.delenv("JESTER_RM_REQUIRED", raising=False)
+    context = {
+        "schemaVersion": "jester-local-launch-v1", "host": "127.0.0.1", "port": 18451,
+        "credential": "local-test-credential-longer-than-32-bytes", "operations": ["unused"],
+    }
+    path = tmp_path / "launch.json"
+    path.write_text(json.dumps(context), encoding="utf-8")
+    monkeypatch.setenv("JESTER_STANDALONE_CONTEXT", str(path))
+    with pytest.raises(RouterError, match="component launch context is not authorized"):
+        serve(host="0.0.0.0", port=18451, signatures_path="", model_name="must-not-be-loaded", pu_index=None, online=False, default_top_k=1)

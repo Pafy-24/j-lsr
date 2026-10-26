@@ -62,7 +62,7 @@ def add_loading_policy_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_MEMORY_LIMIT_MB,
         help=(
-            "Maximum total RAM/VRAM footprint allowed before loading a routing layer. "
+            "Maximum owned signature-vector bytes (in MB) before loading a routing layer; not an OS process limit. "
             f"0 means unlimited. Default: {DEFAULT_MEMORY_LIMIT_MB:g}"
         ),
     )
@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     serve.add_argument(
         "--no-monitor",
         action="store_true",
-        help="Disable the real-time processing-unit and memory dashboard.",
+        help="Disable functional request diagnostics; process resource monitoring belongs to RMA.",
     )
     serve.add_argument(
         "--workers",

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-import itertools
-import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+from jester_sdk_runtime.http import (
+    BoundedHTTPServer, RequestBodyError, discard_denied_body, read_json_body, write_json_response,
+)
+from jester_sdk_runtime.standalone_launch import local_guard
 
 from .config import (
     DEFAULT_CACHE_POLICY,
@@ -21,11 +23,10 @@ from .config import (
     DEFAULT_SIGNATURE_REFRESH_INTERVAL_SECONDS,
 )
 from .console import console
-from .embedding import EmbeddingBatcher, load_model, model_tensor_bytes_by_device
+from .embedding import EmbeddingBatcher, load_model
 from .errors import RouterError
 from .channel_sessions import ChannelSessionDenied, ManagedChannelGuard, guard_from_managed_environment
 from .input_digest import prepare_routing_input
-from .memory import current_process_ram_bytes, current_vram_bytes, estimate_object_bytes
 from .model_selection import resolve_model_binding, validate_signature_model_compatibility
 from .models import LayeredSignature
 from .monitor import ServerMonitor
@@ -68,7 +69,6 @@ class LSRRouteService:
         self.accept_threshold = accept_threshold
         self._state_lock = threading.RLock()
         self._refresh_lock = threading.Lock()
-        self._route_ids = itertools.count(1)
         self.signature_refresh_interval_seconds = DEFAULT_SIGNATURE_REFRESH_INTERVAL_SECONDS
         self._last_signature_refresh = 0.0
         self.registry = SignatureRegistry(signatures_path)
@@ -89,48 +89,13 @@ class LSRRouteService:
         if strategy_asset_path:
             self.load_strategy_asset(strategy_asset_path)
 
-        ram_before_model = current_process_ram_bytes()
         self.model = load_model(self.model_load_path, pu_index, online)
         self.embedding_batcher = EmbeddingBatcher(
             self.model,
             max_batch_units=DEFAULT_EMBEDDING_BATCH_MAX_UNITS,
             max_wait_ms=DEFAULT_EMBEDDING_BATCH_WAIT_MS,
         )
-        model_tensor_bytes = model_tensor_bytes_by_device(self.model)
-        ram_after_model = current_process_ram_bytes()
-        self.monitor: ServerMonitor | None = None
-        if monitor_enabled:
-            self.monitor = ServerMonitor(self)
-            cpu_parameter_bytes = sum(
-                size for device, size in model_tensor_bytes.items() if device.startswith("cpu")
-            )
-            if cpu_parameter_bytes:
-                self.monitor.set_component(
-                    "RAM",
-                    f"model-parameters:{self.model_name}",
-                    cpu_parameter_bytes,
-                    "CPU tensors",
-                    persistent=True,
-                )
-            self.monitor.set_component(
-                "RAM",
-                "embedding-framework/tokenizer/driver",
-                max(0, ram_after_model - ram_before_model - cpu_parameter_bytes),
-                "native/Python working set delta",
-                persistent=True,
-            )
-            self._sync_signature_components()
-            cuda_parameter_bytes = sum(
-                size for device, size in model_tensor_bytes.items() if device.startswith("cuda")
-            )
-            if cuda_parameter_bytes:
-                self.monitor.set_component(
-                    "VRAM",
-                    f"model-parameters:{self.model_name}",
-                    cuda_parameter_bytes,
-                    ", ".join(device for device in model_tensor_bytes if device.startswith("cuda")),
-                    persistent=True,
-                )
+        self.monitor = ServerMonitor(self) if monitor_enabled else None
 
     def build_router(
         self,
@@ -148,7 +113,7 @@ class LSRRouteService:
             accept_threshold=self.accept_threshold,
             cache_policy=DEFAULT_CACHE_POLICY,
             status_callback=self._status,
-            memory_callback=self._memory_event if memory_callback is None else memory_callback,
+            memory_callback=memory_callback,
         )
 
     def routing_router(
@@ -166,51 +131,11 @@ class LSRRouteService:
             if allowed is not None:
                 raise RouterError("None of the allowed_facets are loaded.")
             raise RouterError("No signatures loaded. Use loadsig first.")
-        route_id = next(self._route_ids)
-
-        def memory_event(
-            action: str,
-            memory: str,
-            name: str,
-            size: int,
-            location: str,
-        ) -> None:
-            self._memory_event(
-                action,
-                memory,
-                f"route-{route_id}:{name}",
-                size,
-                location,
-            )
-
-        return self.build_router(top_k, signatures, memory_callback=memory_event)
+        return self.build_router(top_k, signatures)
 
     def _status(self, operation: str, detail: str = "") -> None:
         if self.monitor is not None:
             self.monitor.update(operation, detail)
-
-    def _memory_event(
-        self, action: str, memory: str, name: str, size: int, location: str
-    ) -> None:
-        if self.monitor is None:
-            return
-        if action == "set":
-            self.monitor.set_component(memory, name, size, location)
-        else:
-            self.monitor.remove_component(memory, name)
-
-    def _sync_signature_components(self) -> None:
-        if getattr(self, "monitor", None) is None:
-            return
-        self.monitor.remove_components("RAM", "signature-metadata:")
-        for facet, signature in sorted(self.signatures.items()):
-            self.monitor.set_component(
-                "RAM",
-                f"signature-metadata:{facet}",
-                estimate_object_bytes(signature),
-                "DER metadata/index",
-                persistent=True,
-            )
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
@@ -224,23 +149,13 @@ class LSRRouteService:
             disabled_facets = sorted(self.registry.disabled_facets)
             strategy = self.strategy
             strategy_asset_path = self.strategy_asset_path
-        processing_units = (
-            self.monitor.processing_units_payload() if self.monitor is not None else []
-        )
-        selected_processing_unit = next(
-            (unit for unit in processing_units if unit.get("selected")),
-            None,
-        )
-        if selected_processing_unit is None:
-            unit = getattr(self.model, "processing_unit", None)
-            if unit is not None:
-                selected_processing_unit = {
-                    "index": unit.index,
-                    "kind": unit.kind,
-                    "name": unit.name,
-                    "backend": unit.backend,
-                    "luid": unit.luid or None,
-                }
+        selected_processing_unit = None
+        unit = getattr(self.model, "processing_unit", None)
+        if unit is not None:
+            selected_processing_unit = {
+                "index": unit.index, "kind": unit.kind, "name": unit.name,
+                "backend": unit.backend, "luid": unit.luid or None,
+            }
         return {
             "status": "ok",
             "service": "LSR",
@@ -251,20 +166,15 @@ class LSRRouteService:
             "index_backend": router.index_backend_label(),
             "loading_policy": router.loading_policy_label(),
             "memory_limit_mb": self.memory_limit_mb,
-            "processRamBytes": current_process_ram_bytes(),
-            "processVramBytes": current_vram_bytes(),
             "thresholds": router.thresholds_label(),
             "cachePolicy": router.cache_policy_label(),
             "embeddingBatcher": self.embedding_batcher.stats(),
             "embeddingBackend": str(
                 getattr(self.model, "backend", type(self.model).__name__)
             ),
-            "processingUnits": processing_units,
             "selectedProcessingUnit": selected_processing_unit,
             "loadedLayers": loaded_layers,
             "loadedVectorBytes": loaded_vector_bytes,
-            "memoryComponents": self.monitor.components_payload() if self.monitor is not None else [],
-            "memoryStats": self.monitor.memory_stats() if self.monitor is not None else {},
             "lastRankPerformance": self.monitor.last_profile() if self.monitor is not None else {},
             "signatureFiles": signature_files,
             "staleSignatures": stale_signatures,
@@ -344,7 +254,6 @@ class LSRRouteService:
             self.signatures_path = path
             self.router = router
             self.strategy = strategy
-            self._sync_signature_components()
             return {
                 "loaded": sorted(loaded),
                 "facets": sorted(self.signatures),
@@ -359,7 +268,6 @@ class LSRRouteService:
                 for facet in removed:
                     self.registry.unload(facet, disable=True)
                 self.router = self.build_router(self.default_top_k)
-                self._sync_signature_components()
                 return {"unloaded": removed, "facets": []}
             if not facets:
                 raise RouterError("Provide facets or all=true.")
@@ -374,7 +282,6 @@ class LSRRouteService:
                 else:
                     missing.append(key)
             self.router = self.build_router(self.default_top_k)
-            self._sync_signature_components()
             return {
                 "unloaded": removed,
                 "missing": missing,
@@ -540,7 +447,6 @@ class LSRRouteService:
                     )
                     self.signatures = self.registry.signatures
                     self.router = self.build_router(self.default_top_k)
-                    self._sync_signature_components()
         finally:
             self._refresh_lock.release()
 
@@ -551,44 +457,15 @@ class LSRRouteService:
             close_model()
 
 
-class LSRHTTPServer(HTTPServer):
-    """HTTP server with a bounded worker pool instead of one thread per request."""
+class LSRHTTPServer(BoundedHTTPServer):
+    """LSR routes over the common SDK bounded HTTP transport."""
 
     def __init__(self, address: tuple[str, int], service: LSRRouteService, workers: int = 4, *, managed_channel_guard: ManagedChannelGuard | None = None, require_managed_session: bool = False):
-        super().__init__(address, LSRRequestHandler)
+        super().__init__(address, LSRRequestHandler, workers=workers,
+                         max_pending=DEFAULT_SERVER_MAX_PENDING_REQUESTS, thread_name="lsr-http")
         self.service = service
         self.managed_channel_guard = managed_channel_guard
         self.require_managed_session = require_managed_session
-        active_workers = max(1, workers)
-        self.executor = ThreadPoolExecutor(
-            max_workers=active_workers,
-            thread_name_prefix="lsr-http",
-        )
-        self.request_slots = threading.BoundedSemaphore(
-            active_workers + max(0, DEFAULT_SERVER_MAX_PENDING_REQUESTS)
-        )
-
-    def process_request(self, request: Any, client_address: Any) -> None:
-        self.request_slots.acquire()
-        try:
-            self.executor.submit(self._process_request, request, client_address)
-        except Exception:
-            self.request_slots.release()
-            self.shutdown_request(request)
-            raise
-
-    def _process_request(self, request: Any, client_address: Any) -> None:
-        try:
-            self.finish_request(request, client_address)
-        except Exception:
-            self.handle_error(request, client_address)
-        finally:
-            self.shutdown_request(request)
-            self.request_slots.release()
-
-    def server_close(self) -> None:
-        super().server_close()
-        self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 class LSRRequestHandler(BaseHTTPRequestHandler):
@@ -654,67 +531,26 @@ class LSRRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _read_json(self) -> Any:
-        raw_length = self.headers.get("Content-Length", "0") or "0"
         try:
-            length = int(raw_length)
-        except (TypeError, ValueError) as exc:
-            raise RouterError("Content-Length must be an integer.") from exc
-        if length <= 0:
-            raise RouterError("Missing JSON body.")
-        if length > DEFAULT_SERVER_MAX_REQUEST_BYTES:
-            raise RouterError(
-                f"JSON body exceeds the {DEFAULT_SERVER_MAX_REQUEST_BYTES}-byte limit."
-            )
-        raw = self.rfile.read(length)
-        try:
-            return json.loads(raw.decode("utf-8"))
+            return read_json_body(self, max_bytes=DEFAULT_SERVER_MAX_REQUEST_BYTES)
+        except RequestBodyError as exc:
+            messages = {
+                "invalid_length": "Content-Length must be an integer.",
+                "missing_body": "Missing JSON body.",
+                "too_large": f"JSON body exceeds the {DEFAULT_SERVER_MAX_REQUEST_BYTES}-byte limit.",
+            }
+            raise RouterError(messages[exc.reason]) from exc
         except UnicodeDecodeError as exc:
             raise RouterError("JSON body must be UTF-8.") from exc
 
     def _discard_denied_request_body(self) -> int:
-        """Best-effort discard of a small denied body before closing the socket."""
-        if self.headers.get("Transfer-Encoding") is not None:
-            return 0
-        content_lengths = self.headers.get_all("Content-Length", [])
-        if len(content_lengths) != 1:
-            return 0
-        raw_length = content_lengths[0]
-        if not raw_length.isascii() or not raw_length.isdigit():
-            return 0
-        if len(raw_length) > len(str(DENIED_REQUEST_BODY_DISCARD_MAX_BYTES)):
-            return 0
-        length = int(raw_length)
-        if length <= 0 or length > DENIED_REQUEST_BODY_DISCARD_MAX_BYTES:
-            return 0
-
-        previous_timeout = self.connection.gettimeout()
-        deadline = time.monotonic() + DENIED_REQUEST_BODY_DISCARD_DEADLINE_SECONDS
-        remaining = length
-        discarded = 0
-        try:
-            while remaining:
-                timeout = deadline - time.monotonic()
-                if timeout <= 0:
-                    break
-                self.connection.settimeout(timeout)
-                chunk = self.rfile.read1(min(remaining, 64 * 1024))
-                if not chunk:
-                    break
-                discarded += len(chunk)
-                remaining -= len(chunk)
-        except (OSError, TimeoutError, socket.timeout):
-            pass
-        finally:
-            self.connection.settimeout(previous_timeout)
-        return discarded
+        return discard_denied_body(
+            self, max_bytes=DENIED_REQUEST_BODY_DISCARD_MAX_BYTES,
+            deadline_seconds=DENIED_REQUEST_BODY_DISCARD_DEADLINE_SECONDS,
+        )
 
     def _write_json(self, status: HTTPStatus, payload: Any) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(int(status))
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        write_json_response(self, status, payload)
 
 
 def extract_prompt(payload: Any) -> str:
@@ -896,6 +732,13 @@ def serve(
     model_identity: str | None = None,
     strategy_asset_path: str | None = None,
 ) -> None:
+    managed = os.environ.get("JESTER_RM_REQUIRED", "").lower() in {"1", "true", "yes", "on"}
+    try:
+        if managed and os.environ.get("JESTER_STANDALONE_CONTEXT"):
+            raise PermissionError("standalone context cannot replace a managed launch")
+        guard = guard_from_managed_environment() if managed else local_guard(host=host, port=port)
+    except PermissionError as exc:
+        raise RouterError("component launch context is not authorized") from exc
     service = LSRRouteService(
         signatures_path=signatures_path,
         model_name=model_name,
@@ -911,13 +754,7 @@ def serve(
         model_identity=model_identity,
         strategy_asset_path=strategy_asset_path,
     )
-    managed = os.environ.get("JESTER_RM_REQUIRED", "").lower() in {"1", "true", "yes", "on"}
-    try:
-        guard = guard_from_managed_environment() if managed else None
-    except ChannelSessionDenied as exc:
-        service.close()
-        raise RouterError("managed channel context is required") from exc
-    server = LSRHTTPServer((host, port), service, workers=workers, managed_channel_guard=guard, require_managed_session=managed)
+    server = LSRHTTPServer((host, port), service, workers=workers, managed_channel_guard=guard, require_managed_session=managed or guard is not None)
     console.print(
         f"LSR server ready on http://{host}:{port} "
         f"with facets: {', '.join(service.health()['facets']) or 'none'}"

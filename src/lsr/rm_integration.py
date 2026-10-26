@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from jester_sdk_runtime.lifecycle import start_telemetry
+from jester_sdk_runtime.launch import ManagedLaunchError, require_execution_launch
 
 from .errors import RouterError
 
@@ -29,16 +29,12 @@ def require_managed_launch(args: Any) -> Any:
             "hardware inventory is owned by Resource Manager."
         )
     try:
-        from jester_rm_client import require_lease
-
-        lease = require_lease()
-    except ImportError as exc:
-        raise RouterError(
-            "RM_LEASE_REQUIRED: install jester-rm-client and launch this LSR task through jester-rm."
-        ) from exc
-    except Exception as exc:
-        code = getattr(exc, "code", "RM_LEASE_REQUIRED")
-        raise RouterError(f"{code}: {exc}") from exc
+        lease = require_execution_launch()
+    except ManagedLaunchError as exc:
+        message = "install jester-rm-client and launch this LSR task through jester-rm." if exc.client_unavailable else str(exc)
+        raise RouterError(f"{exc.code}: {message}") from exc
+    if lease is None:
+        return None
     if getattr(args, "PU", None) is not None:
         raise RouterError("--PU is owned by Resource Manager for managed LSR processes.")
     if float(getattr(args, "memory_limit_mb", 0.0) or 0.0) != 0.0:

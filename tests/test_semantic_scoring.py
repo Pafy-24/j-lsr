@@ -32,7 +32,7 @@ class SemanticScoringTests(unittest.TestCase):
         self.assertTrue(all(result["decision"] != "refused" for result in route["results"]))
         self.assertEqual(route["signatureMemory"]["byLevel"]["1"]["loads"], 2)
 
-    def test_rank_profiler_reports_time_and_memory(self) -> None:
+    def test_rank_profiler_reports_time_without_process_resource_sampling(self) -> None:
         profiler = RankProfiler(sample_interval_seconds=0.001)
         profiler.start()
         started = __import__("time").perf_counter()
@@ -40,8 +40,8 @@ class SemanticScoringTests(unittest.TestCase):
         profiler.stage("routing", started)
         result = profiler.finish()
         self.assertGreaterEqual(result["timing"]["rankingMs"], 3.0)
-        self.assertIn("ramPeakBytes", result["resources"])
-        self.assertIn("cuda", result["resources"])
+        self.assertNotIn("resources", result)
+        self.assertNotIn("cpuTimeMs", result["timing"])
 
     def test_model_memory_is_counted_by_actual_tensor_device(self) -> None:
         class Tensor:

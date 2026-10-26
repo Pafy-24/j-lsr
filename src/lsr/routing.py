@@ -22,7 +22,7 @@ from .config import (
 from .dependencies import ensure_numpy
 from .errors import RouterError
 from .indexes import build_index
-from .memory import current_footprint_bytes, format_bytes
+from .memory import format_bytes
 from .models import LayeredSignature
 from .routing_policy import child_ids, top_indices
 from .scoring import confidence_from_score, facet_weight_from_score, weighted_layer_score
@@ -200,7 +200,7 @@ class LSRRouter:
     def loading_policy_label(self) -> str:
         if not self.memory_limit_bytes:
             return "streaming-release-layer"
-        return f"streaming-release-layer:{self.memory_limit_mb:g}MB-total"
+        return f"streaming-release-layer:{self.memory_limit_mb:g}MB-signature-vectors"
 
     def cache_policy_label(self) -> str:
         return self.cache_policy
@@ -226,12 +226,14 @@ class LSRRouter:
     def ensure_memory_available(self, extra_bytes: int, context: str) -> None:
         if not self.memory_limit_bytes:
             return
-        current = current_footprint_bytes()
+        # A functional cache budget counts owned signature vectors. Process
+        # RSS/VRAM limits and monitoring belong to RMA, not the router.
+        current = sum(signature.loaded_vector_bytes() for signature in self.signatures.values())
         required = current + max(0, int(extra_bytes))
         if required > self.memory_limit_bytes:
             raise RouterError(
-                f"Memory limit exceeded before loading {context}: "
-                f"current RAM/VRAM footprint {format_bytes(current)}, "
+                f"Signature vector budget exceeded before loading {context}: "
+                f"loaded signature vectors {format_bytes(current)}, "
                 f"needed chunk {format_bytes(extra_bytes)}, "
                 f"limit {format_bytes(self.memory_limit_bytes)}. "
                 "Increase --memory-limit-mb or use a smaller model/dataset."

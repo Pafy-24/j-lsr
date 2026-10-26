@@ -7,7 +7,6 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from jester_sdk_runtime.lifecycle import telemetry_session
 
 from .args import parse_args
 from .console import console, error_console
@@ -19,7 +18,7 @@ from .embedding import embed_texts, load_model
 from .errors import RouterError
 from .input_digest import prepare_routing_input, prepare_routing_input_from_path
 from .io_utils import load_batch_prompts, read_file, read_stdin_if_available, read_text_arg
-from .memory import current_footprint_bytes, format_bytes
+from .memory import format_bytes
 from .model_selection import (
     resolve_model_binding,
     resolve_model_name,
@@ -28,7 +27,7 @@ from .model_selection import (
 from .models import FacetSignature
 from .profiling import RankProfiler
 from .routing import LSRRouter, json_ready_route
-from .rm_integration import require_managed_launch, start_telemetry
+from .rm_integration import require_managed_launch
 from .server import serve
 from .signatures import SignatureBuilder, SignatureStore
 from .registry import SignatureRegistry
@@ -524,14 +523,11 @@ class RouterCLI:
         lexical_scores: list[float] = []
         generic_penalties: list[float] = []
         repetition_penalties: list[float] = []
-        # Warm the embedding/CUDA kernels and one routing path before taking
-        # the memory baseline; otherwise lazy backend initialization is
-        # incorrectly reported as per-evaluation signature growth.
+        # Warm the embedding kernels and routing path before timing evaluation.
         if prompts:
             warm_input = prepare_routing_input(prompts[0], self.args.large_input)
             warm_embedding = embed_texts(model, warm_input.routing_units)
             router.route(warm_input.routing_text, warm_embedding)
-        before_memory = process_memory_mb()
 
         for prompt, expected_facets in zip(prompts, expected):
             routing_input = prepare_routing_input(prompt, self.args.large_input)
@@ -586,7 +582,6 @@ class RouterCLI:
                     if decision in decisions_by_layer[key]:
                         decisions_by_layer[key][decision] += 1
 
-        after_memory = process_memory_mb()
         total = len(ranks) or 1
         return {
             "items": len(ranks),
@@ -622,10 +617,7 @@ class RouterCLI:
                 "p95": percentile(latencies_ms, 95),
                 "p99": percentile(latencies_ms, 99),
             },
-            "memoryMb": {
-                "before": before_memory,
-                "after": after_memory,
-            },
+            "resourceMonitoring": {"authority": "RMA", "scope": "external-process"},
             "loadedVectorBytes": sum(signature.loaded_vector_bytes() for signature in signatures.values()),
             "thresholds": {
                 "pass": pass_threshold,
@@ -684,23 +676,7 @@ def print_route_table(route: dict[str, Any], args: argparse.Namespace) -> None:
             "[dim]Timing: "
             f"rank {float(timing.get('rankingMs', 0.0)):.3f} ms | "
             f"embedding {float(timing.get('embeddingMs', 0.0)):.3f} ms | "
-            f"routing {float(timing.get('routingMs', 0.0)):.3f} ms | "
-            f"CPU {float(timing.get('cpuTimeMs', 0.0)):.3f} ms[/dim]"
-        )
-        resources = performance.get("resources", {})
-        cuda = resources.get("cuda", []) if isinstance(resources, dict) else []
-        cuda_peak = sum(int(item.get("peakAllocatedDeltaBytes", 0)) for item in cuda)
-        cuda_retained = sum(int(item.get("allocatedRetainedDeltaBytes", 0)) for item in cuda)
-        console.print(
-            "[dim]Peak during rank: "
-            f"RAM +{format_bytes(int(resources.get('ramPeakDeltaBytes', 0)))} | "
-            f"CUDA allocated +{format_bytes(cuda_peak)}[/dim]"
-        )
-        console.print(
-            "[dim]Retained after rank: "
-            f"working set {format_signed_bytes(int(resources.get('ramRetainedDeltaBytes', 0)))} | "
-            f"private {format_signed_bytes(int(resources.get('privateRetainedDeltaBytes', 0)))} | "
-            f"CUDA allocated {format_signed_bytes(cuda_retained)}[/dim]"
+            f"routing {float(timing.get('routingMs', 0.0)):.3f} ms[/dim]"
         )
     signature_memory = route.get("signatureMemory", {})
     if isinstance(signature_memory, dict) and signature_memory:
@@ -828,10 +804,6 @@ def threshold_grid() -> list[tuple[float, float]]:
     ]
 
 
-def process_memory_mb() -> float:
-    return current_footprint_bytes() / (1024 * 1024)
-
-
 def estimate_signature_ram_mb(signatures: dict[str, Any]) -> float:
     total_bytes = 0
     for signature in signatures.values():
@@ -922,8 +894,7 @@ def main() -> int:
     args = parse_args()
     try:
         require_managed_launch(args)
-        with telemetry_session(start_telemetry):
-            return RouterCLI(args).run()
+        return RouterCLI(args).run()
     except RouterError as exc:
         error_console.print(f"[red]Error:[/red] {exc}")
         return 2
